@@ -1,5 +1,7 @@
 import os
+import re
 import json
+import uuid
 import unicodedata
 import threading
 import requests
@@ -35,9 +37,11 @@ OPENAI_MODEL = os.getenv(
     "gpt-5.6-luna"
 )
 
-ADMIN_WHATSAPP_NUMBER = os.getenv("ADMIN_WHATSAPP_NUMBER")
-
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+ADMIN_WHATSAPP_NUMBER = os.getenv(
+    "ADMIN_WHATSAPP_NUMBER"
+)
 
 GRAPH_API_VERSION = os.getenv(
     "GRAPH_API_VERSION",
@@ -68,7 +72,7 @@ database_lock = threading.Lock()
 
 
 # =========================================================
-# BANCO DE DADOS
+# POSTGRESQL
 # =========================================================
 
 def get_db_connection():
@@ -97,21 +101,20 @@ def initialize_database():
         if database_initialized:
             return
 
-        print(
-            "Inicializando PostgreSQL..."
-        )
+        print("Inicializando PostgreSQL...")
 
         with get_db_connection() as conn:
 
             with conn.cursor() as cursor:
 
-                # =========================================
+                # =================================================
                 # EMPRESAS
-                # =========================================
+                # =================================================
 
                 cursor.execute(
                     """
                     CREATE TABLE IF NOT EXISTS companies (
+
                         id BIGSERIAL PRIMARY KEY,
 
                         slug TEXT NOT NULL UNIQUE,
@@ -130,13 +133,14 @@ def initialize_database():
                 )
 
 
-                # =========================================
+                # =================================================
                 # USUÁRIOS
-                # =========================================
+                # =================================================
 
                 cursor.execute(
                     """
                     CREATE TABLE IF NOT EXISTS users (
+
                         id BIGSERIAL PRIMARY KEY,
 
                         company_id BIGINT
@@ -162,6 +166,10 @@ def initialize_database():
                             NOT NULL
                             DEFAULT FALSE,
 
+                        is_platform_admin BOOLEAN
+                            NOT NULL
+                            DEFAULT FALSE,
+
                         active BOOLEAN
                             NOT NULL
                             DEFAULT TRUE,
@@ -174,13 +182,28 @@ def initialize_database():
                 )
 
 
-                # =========================================
+                # Se a tabela já existia antes desta versão,
+                # adicionamos o novo campo automaticamente.
+
+                cursor.execute(
+                    """
+                    ALTER TABLE users
+                    ADD COLUMN IF NOT EXISTS
+                    is_platform_admin BOOLEAN
+                    NOT NULL
+                    DEFAULT FALSE;
+                    """
+                )
+
+
+                # =================================================
                 # CONTAS META
-                # =========================================
+                # =================================================
 
                 cursor.execute(
                     """
                     CREATE TABLE IF NOT EXISTS meta_accounts (
+
                         id BIGSERIAL PRIMARY KEY,
 
                         company_id BIGINT
@@ -206,13 +229,14 @@ def initialize_database():
                 )
 
 
-                # =========================================
-                # LOGS / AUDITORIA
-                # =========================================
+                # =================================================
+                # LOGS
+                # =================================================
 
                 cursor.execute(
                     """
                     CREATE TABLE IF NOT EXISTS activity_logs (
+
                         id BIGSERIAL PRIMARY KEY,
 
                         company_id BIGINT
@@ -235,9 +259,9 @@ def initialize_database():
                 )
 
 
-                # =========================================
-                # CRIAR EMPRESA INICIAL
-                # =========================================
+                # =================================================
+                # EMPRESA INICIAL
+                # =================================================
 
                 cursor.execute(
                     """
@@ -245,6 +269,7 @@ def initialize_database():
                         slug,
                         name
                     )
+
                     VALUES (
                         'principal',
                         %s
@@ -266,33 +291,40 @@ def initialize_database():
                 company_id = company["id"]
 
 
-                # =========================================
-                # CADASTRAR USUÁRIO ADMINISTRADOR
-                # =========================================
+                # =================================================
+                # ADMINISTRADOR PRINCIPAL
+                # =================================================
 
                 if ADMIN_WHATSAPP_NUMBER:
 
                     cursor.execute(
                         """
                         INSERT INTO users (
+
                             company_id,
                             whatsapp_number,
                             name,
                             role,
                             can_read_ads,
-                            can_create_campaigns
+                            can_create_campaigns,
+                            is_platform_admin
+
                         )
 
                         VALUES (
+
                             %s,
                             %s,
                             %s,
                             'admin',
                             TRUE,
+                            TRUE,
                             TRUE
+
                         )
 
                         ON CONFLICT (whatsapp_number)
+
                         DO UPDATE SET
 
                             company_id =
@@ -307,38 +339,46 @@ def initialize_database():
                             can_create_campaigns =
                                 TRUE,
 
+                            is_platform_admin =
+                                TRUE,
+
                             active =
                                 TRUE;
                         """,
                         (
                             company_id,
                             ADMIN_WHATSAPP_NUMBER,
-                            "Administrador"
+                            "Administrador Principal"
                         )
                     )
 
 
-                # =========================================
-                # CADASTRAR CONTA META ATUAL
-                # =========================================
+                # =================================================
+                # CONTA META INICIAL
+                # =================================================
 
                 if META_AD_ACCOUNT_ID:
 
                     cursor.execute(
                         """
                         INSERT INTO meta_accounts (
+
                             company_id,
                             ad_account_id,
                             name
+
                         )
 
                         VALUES (
+
                             %s,
                             %s,
                             %s
+
                         )
 
                         ON CONFLICT (ad_account_id)
+
                         DO UPDATE SET
 
                             company_id =
@@ -363,12 +403,10 @@ def initialize_database():
 
 
 # =========================================================
-# BUSCAR USUÁRIO PELO WHATSAPP
+# UTILIDADES DE BANCO
 # =========================================================
 
-def get_user_context(
-    whatsapp_number
-):
+def get_user_context(whatsapp_number):
 
     initialize_database()
 
@@ -392,6 +430,8 @@ def get_user_context(
 
                     u.can_create_campaigns,
 
+                    u.is_platform_admin,
+
                     c.id AS company_id,
 
                     c.name AS company_name,
@@ -408,8 +448,11 @@ def get_user_context(
                     AND m.active = TRUE
 
                 WHERE
+
                     u.whatsapp_number = %s
+
                     AND u.active = TRUE
+
                     AND c.active = TRUE
 
                 ORDER BY m.id ASC
@@ -423,10 +466,6 @@ def get_user_context(
 
             return cursor.fetchone()
 
-
-# =========================================================
-# LOG DE AUDITORIA
-# =========================================================
 
 def log_activity(
     context,
@@ -458,17 +497,21 @@ def log_activity(
                 cursor.execute(
                     """
                     INSERT INTO activity_logs (
+
                         company_id,
                         user_id,
                         action,
                         details
+
                     )
 
                     VALUES (
+
                         %s,
                         %s,
                         %s,
                         %s::jsonb
+
                     );
                     """,
                     (
@@ -476,7 +519,8 @@ def log_activity(
                         user_id,
                         action,
                         json.dumps(
-                            details or {}
+                            details or {},
+                            ensure_ascii=False
                         )
                     )
                 )
@@ -484,9 +528,258 @@ def log_activity(
     except Exception as error:
 
         print(
-            "ERRO AO GRAVAR LOG:",
+            "ERRO LOG:",
             repr(error)
         )
+
+
+# =========================================================
+# CRIAÇÃO DE CLIENTE
+# =========================================================
+
+def create_slug(name):
+
+    text = unicodedata.normalize(
+        "NFD",
+        name.lower()
+    )
+
+    text = "".join(
+        char
+        for char in text
+        if unicodedata.category(char)
+        != "Mn"
+    )
+
+    text = re.sub(
+        r"[^a-z0-9]+",
+        "-",
+        text
+    )
+
+    text = text.strip("-")
+
+    if not text:
+        text = "cliente"
+
+    suffix = uuid.uuid4().hex[:6]
+
+    return f"{text}-{suffix}"
+
+
+def normalize_phone_number(number):
+
+    return "".join(
+        char
+        for char in number
+        if char.isdigit()
+    )
+
+
+def create_client(
+
+    company_name,
+
+    whatsapp_number,
+
+    can_read_ads,
+
+    can_create_campaigns
+
+):
+
+    initialize_database()
+
+    whatsapp_number = normalize_phone_number(
+        whatsapp_number
+    )
+
+    if (
+        len(whatsapp_number) < 10
+        or len(whatsapp_number) > 15
+    ):
+
+        return (
+            None,
+            "Número de WhatsApp inválido."
+        )
+
+
+    with get_db_connection() as conn:
+
+        with conn.cursor() as cursor:
+
+            # Verifica se o WhatsApp já existe.
+
+            cursor.execute(
+                """
+                SELECT id
+                FROM users
+                WHERE whatsapp_number = %s;
+                """,
+                (
+                    whatsapp_number,
+                )
+            )
+
+            existing_user = cursor.fetchone()
+
+            if existing_user:
+
+                return (
+                    None,
+                    "Esse WhatsApp já está cadastrado."
+                )
+
+
+            slug = create_slug(
+                company_name
+            )
+
+
+            # Cria empresa.
+
+            cursor.execute(
+                """
+                INSERT INTO companies (
+
+                    slug,
+                    name
+
+                )
+
+                VALUES (
+
+                    %s,
+                    %s
+
+                )
+
+                RETURNING id;
+                """,
+                (
+                    slug,
+                    company_name
+                )
+            )
+
+            company = cursor.fetchone()
+
+            company_id = company["id"]
+
+
+            # Cria administrador daquela empresa.
+
+            cursor.execute(
+                """
+                INSERT INTO users (
+
+                    company_id,
+                    whatsapp_number,
+                    name,
+                    role,
+                    can_read_ads,
+                    can_create_campaigns,
+                    is_platform_admin
+
+                )
+
+                VALUES (
+
+                    %s,
+                    %s,
+                    %s,
+                    'admin',
+                    %s,
+                    %s,
+                    FALSE
+
+                )
+
+                RETURNING id;
+                """,
+                (
+                    company_id,
+                    whatsapp_number,
+                    "Administrador",
+                    can_read_ads,
+                    can_create_campaigns
+                )
+            )
+
+            user = cursor.fetchone()
+
+
+    return {
+        "company_id":
+            company_id,
+
+        "user_id":
+            user["id"],
+
+        "company_name":
+            company_name,
+
+        "whatsapp_number":
+            whatsapp_number,
+
+        "can_read_ads":
+            can_read_ads,
+
+        "can_create_campaigns":
+            can_create_campaigns
+
+    }, None
+
+
+# =========================================================
+# LISTAR CLIENTES
+# =========================================================
+
+def list_clients():
+
+    initialize_database()
+
+    with get_db_connection() as conn:
+
+        with conn.cursor() as cursor:
+
+            cursor.execute(
+                """
+                SELECT
+
+                    c.id AS company_id,
+
+                    c.name AS company_name,
+
+                    u.whatsapp_number,
+
+                    u.can_read_ads,
+
+                    u.can_create_campaigns,
+
+                    m.ad_account_id
+
+                FROM companies c
+
+                INNER JOIN users u
+                    ON u.company_id = c.id
+
+                LEFT JOIN meta_accounts m
+                    ON m.company_id = c.id
+                    AND m.active = TRUE
+
+                WHERE
+
+                    c.active = TRUE
+
+                    AND u.active = TRUE
+
+                ORDER BY c.id ASC;
+                """
+            )
+
+            return cursor.fetchall()
 
 
 # =========================================================
@@ -497,15 +790,24 @@ def log_activity(
 def home():
 
     return {
-        "status": "online",
-        "service": "whatsapp-meta-prod",
-        "database": "configured",
-        "architecture": "multi_company_v1"
+
+        "status":
+            "online",
+
+        "service":
+            "whatsapp-meta-prod",
+
+        "database":
+            "online",
+
+        "architecture":
+            "multi_company_v2"
+
     }, 200
 
 
 # =========================================================
-# TESTE DO POSTGRESQL
+# DB CHECK
 # =========================================================
 
 @app.route(
@@ -539,7 +841,12 @@ def database_check():
                         (
                             SELECT COUNT(*)
                             FROM meta_accounts
-                        ) AS meta_accounts;
+                        ) AS meta_accounts,
+
+                        (
+                            SELECT COUNT(*)
+                            FROM activity_logs
+                        ) AS activity_logs;
                     """
                 )
 
@@ -547,16 +854,22 @@ def database_check():
 
 
         return {
-            "status": "database_online",
-            "companies": result[
-                "companies"
-            ],
-            "users": result[
-                "users"
-            ],
-            "meta_accounts": result[
-                "meta_accounts"
-            ]
+
+            "status":
+                "database_online",
+
+            "companies":
+                result["companies"],
+
+            "users":
+                result["users"],
+
+            "meta_accounts":
+                result["meta_accounts"],
+
+            "activity_logs":
+                result["activity_logs"]
+
         }, 200
 
 
@@ -568,13 +881,18 @@ def database_check():
         )
 
         return {
-            "status": "database_error",
-            "error": str(error)
+
+            "status":
+                "database_error",
+
+            "error":
+                str(error)
+
         }, 500
 
 
 # =========================================================
-# VERIFICAÇÃO WEBHOOK META
+# WEBHOOK VERIFICATION
 # =========================================================
 
 @app.route(
@@ -594,6 +912,7 @@ def verify_webhook():
     challenge = request.args.get(
         "hub.challenge"
     )
+
 
     if (
         mode == "subscribe"
@@ -644,9 +963,7 @@ def format_brl(value):
         .replace("X", ".")
     )
 
-    return (
-        f"R$ {formatted}"
-    )
+    return f"R$ {formatted}"
 
 
 def format_number(value):
@@ -655,6 +972,33 @@ def format_number(value):
         f"{int(value):,}"
         .replace(",", ".")
     )
+
+
+def text_to_bool(text):
+
+    normalized = normalize_text(
+        text
+    )
+
+    if normalized in [
+        "sim",
+        "s",
+        "true",
+        "1"
+    ]:
+
+        return True
+
+    if normalized in [
+        "nao",
+        "n",
+        "false",
+        "0"
+    ]:
+
+        return False
+
+    return None
 
 
 # =========================================================
@@ -672,13 +1016,16 @@ def send_whatsapp_message(
         f"{PHONE_NUMBER_ID}/messages"
     )
 
+
     headers = {
+
         "Authorization":
             f"Bearer {WHATSAPP_TOKEN}",
 
         "Content-Type":
             "application/json"
     }
+
 
     payload = {
 
@@ -704,6 +1051,7 @@ def send_whatsapp_message(
         }
     }
 
+
     response = requests.post(
         url,
         headers=headers,
@@ -711,17 +1059,19 @@ def send_whatsapp_message(
         timeout=30
     )
 
+
     print(
         "RESPOSTA WHATSAPP:",
         response.status_code,
         response.text
     )
 
+
     return response
 
 
 # =========================================================
-# LEADS
+# META ADS — LEADS
 # =========================================================
 
 def get_leads(actions):
@@ -849,15 +1199,20 @@ def get_last_7_days_report(
 
         return {
 
-            "spend": 0,
+            "spend":
+                0,
 
-            "impressions": 0,
+            "impressions":
+                0,
 
-            "clicks": 0,
+            "clicks":
+                0,
 
-            "leads": 0,
+            "leads":
+                0,
 
-            "cpl": 0
+            "cpl":
+                0
 
         }, None
 
@@ -897,15 +1252,11 @@ def get_last_7_days_report(
     )
 
 
-    if leads > 0:
-
-        cpl = (
-            spend / leads
-        )
-
-    else:
-
-        cpl = 0
+    cpl = (
+        spend / leads
+        if leads > 0
+        else 0
+    )
 
 
     return {
@@ -929,7 +1280,7 @@ def get_last_7_days_report(
 
 
 # =========================================================
-# META ADS — CRIAR CAMPANHA TESTE
+# META ADS — CRIAÇÃO
 # =========================================================
 
 def create_test_campaign(
@@ -999,22 +1350,8 @@ def create_test_campaign(
     result = response.json()
 
 
-    campaign_id = result.get(
-        "id"
-    )
-
-
-    if not campaign_id:
-
-        return (
-            None,
-            "Meta não retornou "
-            "o ID da campanha."
-        )
-
-
     return (
-        campaign_id,
+        result.get("id"),
         None
     )
 
@@ -1069,15 +1406,12 @@ R$ {report['cpl']:.2f}
 Você é um analista sênior
 especializado em Meta Ads.
 
-Analise exclusivamente
+Analise somente
 os dados fornecidos.
 
 Nunca invente números,
 campanhas, anúncios,
 conjuntos ou causas.
-
-Diferencie fatos
-de hipóteses.
 
 Responda em português
 do Brasil.
@@ -1098,8 +1432,7 @@ PERGUNTA:
 
 {user_question}
 
-
-DADOS REAIS:
+DADOS:
 
 {dados}
 """
@@ -1111,12 +1444,10 @@ DADOS REAIS:
 
 
 # =========================================================
-# RELATÓRIO FORMATADO
+# RELATÓRIO
 # =========================================================
 
-def build_basic_report(
-    report
-):
+def build_basic_report(report):
 
     text = (
 
@@ -1140,7 +1471,6 @@ def build_basic_report(
     if report["leads"] > 0:
 
         text += (
-
             f"💵 CPL: "
             f"{format_brl(report['cpl'])}"
         )
@@ -1240,7 +1570,7 @@ def receive_webhook():
 
 
         # =================================================
-        # IDENTIFICAR CLIENTE NO POSTGRESQL
+        # DESCOBRIR QUEM ESTÁ FALANDO
         # =================================================
 
         context = get_user_context(
@@ -1260,13 +1590,188 @@ def receive_webhook():
             )
 
 
+            return (
+                "EVENT_RECEIVED",
+                200
+            )
+
+
+        ad_account_id = context.get(
+            "ad_account_id"
+        )
+
+
+        # =================================================
+        # CADASTRAR CLIENTE
+        # SOMENTE ADMINISTRADOR DA PLATAFORMA
+        # =================================================
+
+        if received_text.startswith(
+            "cadastrar cliente"
+        ):
+
+
+            if not context[
+                "is_platform_admin"
+            ]:
+
+                send_whatsapp_message(
+                    sender,
+                    (
+                        "⛔ Este comando é "
+                        "exclusivo do administrador "
+                        "da plataforma."
+                    )
+                )
+
+
+                return (
+                    "EVENT_RECEIVED",
+                    200
+                )
+
+
+            parts = [
+                item.strip()
+                for item
+                in original_text.split("|")
+            ]
+
+
+            if len(parts) != 5:
+
+                send_whatsapp_message(
+                    sender,
+                    (
+                        "❌ *FORMATO INCORRETO*\n\n"
+
+                        "Use exatamente:\n\n"
+
+                        "cadastrar cliente | "
+                        "Nome da empresa | "
+                        "5531999999999 | "
+                        "sim | nao\n\n"
+
+                        "O primeiro SIM/NAO define "
+                        "permissão de leitura.\n\n"
+
+                        "O segundo SIM/NAO define "
+                        "permissão de criação."
+                    )
+                )
+
+
+                return (
+                    "EVENT_RECEIVED",
+                    200
+                )
+
+
+            company_name = parts[1]
+
+            new_whatsapp = parts[2]
+
+            read_permission = text_to_bool(
+                parts[3]
+            )
+
+            create_permission = text_to_bool(
+                parts[4]
+            )
+
+
+            if (
+                read_permission is None
+                or
+                create_permission is None
+            ):
+
+                send_whatsapp_message(
+                    sender,
+                    (
+                        "❌ Nas permissões use "
+                        "apenas SIM ou NAO."
+                    )
+                )
+
+
+                return (
+                    "EVENT_RECEIVED",
+                    200
+                )
+
+
+            client, error = create_client(
+
+                company_name,
+
+                new_whatsapp,
+
+                read_permission,
+
+                create_permission
+            )
+
+
+            if error:
+
+                send_whatsapp_message(
+                    sender,
+                    (
+                        "❌ Não consegui "
+                        "cadastrar o cliente.\n\n"
+                        f"{error}"
+                    )
+                )
+
+
+                return (
+                    "EVENT_RECEIVED",
+                    200
+                )
+
+
             log_activity(
-                None,
-                "unauthorized_number",
-                {
-                    "whatsapp_number":
-                        sender
-                }
+                context,
+                "client_created",
+                client
+            )
+
+
+            leitura = (
+                "SIM"
+                if read_permission
+                else "NÃO"
+            )
+
+
+            criacao = (
+                "SIM"
+                if create_permission
+                else "NÃO"
+            )
+
+
+            send_whatsapp_message(
+                sender,
+                (
+                    "✅ *CLIENTE CADASTRADO*\n\n"
+
+                    f"*Empresa:*\n"
+                    f"{company_name}\n\n"
+
+                    f"*WhatsApp:*\n"
+                    f"{client['whatsapp_number']}\n\n"
+
+                    f"*Consultar Meta Ads:*\n"
+                    f"{leitura}\n\n"
+
+                    f"*Criar campanhas:*\n"
+                    f"{criacao}\n\n"
+
+                    "*Conta Meta:*\n"
+                    "Ainda não vinculada."
+                )
             )
 
 
@@ -1276,21 +1781,79 @@ def receive_webhook():
             )
 
 
-        ad_account_id = (
-            context.get(
-                "ad_account_id"
+        # =================================================
+        # LISTAR CLIENTES
+        # =================================================
+
+        if received_text == "listar clientes":
+
+            if not context[
+                "is_platform_admin"
+            ]:
+
+                send_whatsapp_message(
+                    sender,
+                    "⛔ Acesso negado."
+                )
+
+
+                return (
+                    "EVENT_RECEIVED",
+                    200
+                )
+
+
+            clients = list_clients()
+
+
+            lines = [
+                "👥 *CLIENTES CADASTRADOS*\n"
+            ]
+
+
+            for client in clients:
+
+                conta = (
+                    client[
+                        "ad_account_id"
+                    ]
+                    or "Sem Meta vinculada"
+                )
+
+
+                lines.append(
+                    (
+                        f"\n*{client['company_name']}*\n"
+                        f"WhatsApp: "
+                        f"{client['whatsapp_number']}\n"
+                        f"Meta: {conta}\n"
+                    )
+                )
+
+
+            send_whatsapp_message(
+                sender,
+                "".join(lines)
             )
-        )
+
+
+            return (
+                "EVENT_RECEIVED",
+                200
+            )
 
 
         # =================================================
         # QUEM SOU EU
         # =================================================
 
-        if (
-            received_text
-            == "quem sou eu"
-        ):
+        if received_text == "quem sou eu":
+
+            conta = (
+                ad_account_id
+                or "Não vinculada"
+            )
+
 
             leitura = (
                 "SIM"
@@ -1322,7 +1885,7 @@ def receive_webhook():
                     f"{context['whatsapp_number']}\n\n"
 
                     f"*Conta Meta:*\n"
-                    f"{ad_account_id}\n\n"
+                    f"{conta}\n\n"
 
                     f"*Pode consultar Ads:*\n"
                     f"{leitura}\n\n"
@@ -1330,12 +1893,6 @@ def receive_webhook():
                     f"*Pode criar campanhas:*\n"
                     f"{criacao}"
                 )
-            )
-
-
-            log_activity(
-                context,
-                "identity_check"
             )
 
 
@@ -1349,11 +1906,7 @@ def receive_webhook():
         # CRIAR CAMPANHA TESTE
         # =================================================
 
-        if (
-            received_text
-            == "criar campanha teste"
-        ):
-
+        if received_text == "criar campanha teste":
 
             if not context[
                 "can_create_campaigns"
@@ -1380,9 +1933,9 @@ def receive_webhook():
                 send_whatsapp_message(
                     sender,
                     (
-                        "❌ Nenhuma conta Meta "
-                        "está vinculada "
-                        "à sua empresa."
+                        "❌ Sua empresa ainda "
+                        "não possui uma conta Meta "
+                        "vinculada."
                     )
                 )
 
@@ -1398,35 +1951,22 @@ def receive_webhook():
                 (
                     "⚠️ *CONFIRMAÇÃO NECESSÁRIA*\n\n"
 
-                    f"*Empresa:*\n"
-                    f"{context['company_name']}\n\n"
+                    f"Empresa:\n"
+                    f"*{context['company_name']}*\n\n"
 
-                    f"*Conta:*\n"
-                    f"{ad_account_id}\n\n"
+                    f"Conta:\n"
+                    f"*{ad_account_id}*\n\n"
 
-                    "*Nome:*\n"
-                    "TESTE API WHATSAPP - NAO ATIVAR\n\n"
+                    "Campanha:\n"
+                    "*TESTE API WHATSAPP - NAO ATIVAR*\n\n"
 
-                    "*Objetivo:*\n"
-                    "Tráfego\n\n"
+                    "Status:\n"
+                    "*PAUSADA*\n\n"
 
-                    "*Status:*\n"
-                    "PAUSADA\n\n"
-
-                    "Para continuar responda:\n\n"
+                    "Para continuar:\n\n"
 
                     "*CONFIRMAR CAMPANHA TESTE*"
                 )
-            )
-
-
-            log_activity(
-                context,
-                "campaign_test_requested",
-                {
-                    "ad_account_id":
-                        ad_account_id
-                }
             )
 
 
@@ -1444,7 +1984,6 @@ def receive_webhook():
             received_text
             == "confirmar campanha teste"
         ):
-
 
             if not context[
                 "can_create_campaigns"
@@ -1467,8 +2006,8 @@ def receive_webhook():
                 send_whatsapp_message(
                     sender,
                     (
-                        "❌ Nenhuma conta Meta "
-                        "está cadastrada."
+                        "❌ Conta Meta "
+                        "não vinculada."
                     )
                 )
 
@@ -1497,22 +2036,6 @@ def receive_webhook():
 
             if error:
 
-                print(
-                    "ERRO CAMPANHA:",
-                    error
-                )
-
-
-                log_activity(
-                    context,
-                    "campaign_creation_failed",
-                    {
-                        "error":
-                            error
-                    }
-                )
-
-
                 send_whatsapp_message(
                     sender,
                     (
@@ -1536,10 +2059,7 @@ def receive_webhook():
                         campaign_id,
 
                     "ad_account_id":
-                        ad_account_id,
-
-                    "status":
-                        "PAUSED"
+                        ad_account_id
                 }
             )
 
@@ -1549,17 +2069,14 @@ def receive_webhook():
                 (
                     "✅ *CAMPANHA CRIADA*\n\n"
 
-                    f"*Empresa:*\n"
-                    f"{context['company_name']}\n\n"
+                    f"Empresa:\n"
+                    f"*{context['company_name']}*\n\n"
 
-                    f"*Conta Meta:*\n"
-                    f"{ad_account_id}\n\n"
+                    f"Campaign ID:\n"
+                    f"*{campaign_id}*\n\n"
 
-                    f"*Campaign ID:*\n"
-                    f"{campaign_id}\n\n"
-
-                    "*Status:*\n"
-                    "PAUSADA"
+                    "Status:\n"
+                    "*PAUSADA*"
                 )
             )
 
@@ -1575,15 +2092,10 @@ def receive_webhook():
         # =================================================
 
         if (
-            "gasto"
-            in received_text
-
+            "gasto" in received_text
             and
-
-            "7"
-            in received_text
+            "7" in received_text
         ):
-
 
             if not context[
                 "can_read_ads"
@@ -1609,8 +2121,9 @@ def receive_webhook():
                 send_whatsapp_message(
                     sender,
                     (
-                        "Nenhuma conta Meta "
-                        "cadastrada."
+                        "❌ Sua empresa ainda "
+                        "não possui uma conta Meta "
+                        "vinculada."
                     )
                 )
 
@@ -1639,8 +2152,8 @@ def receive_webhook():
                 send_whatsapp_message(
                     sender,
                     (
-                        "Não consegui "
-                        "consultar o Meta Ads."
+                        "Não consegui consultar "
+                        "o Meta Ads."
                     )
                 )
 
@@ -1649,12 +2162,6 @@ def receive_webhook():
                     "EVENT_RECEIVED",
                     200
                 )
-
-
-            log_activity(
-                context,
-                "meta_report_7_days"
-            )
 
 
             send_whatsapp_message(
@@ -1676,15 +2183,10 @@ def receive_webhook():
         # =================================================
 
         if (
-            "analise"
-            in received_text
-
+            "analise" in received_text
             and
-
-            "7"
-            in received_text
+            "7" in received_text
         ):
-
 
             if not context[
                 "can_read_ads"
@@ -1695,6 +2197,24 @@ def receive_webhook():
                     (
                         "⛔ Você não possui "
                         "permissão de leitura."
+                    )
+                )
+
+
+                return (
+                    "EVENT_RECEIVED",
+                    200
+                )
+
+
+            if not ad_account_id:
+
+                send_whatsapp_message(
+                    sender,
+                    (
+                        "❌ Sua empresa ainda "
+                        "não possui conta Meta "
+                        "vinculada."
                     )
                 )
 
@@ -1717,8 +2237,8 @@ def receive_webhook():
                 send_whatsapp_message(
                     sender,
                     (
-                        "Não consegui "
-                        "consultar a conta."
+                        "Não consegui consultar "
+                        "a conta."
                     )
                 )
 
@@ -1742,12 +2262,6 @@ def receive_webhook():
                         report,
                         original_text
                     )
-                )
-
-
-                log_activity(
-                    context,
-                    "ai_analysis_7_days"
                 )
 
 
@@ -1784,24 +2298,42 @@ def receive_webhook():
         # MENU
         # =================================================
 
+        menu = (
+
+            "🤖 *ASSISTENTE META ADS*\n\n"
+
+            f"Empresa: "
+            f"*{context['company_name']}*\n\n"
+
+            "👤 quem sou eu\n\n"
+
+            "📊 gasto últimos 7 dias\n\n"
+
+            "🤖 analise meus últimos 7 dias\n\n"
+
+            "🔧 criar campanha teste"
+        )
+
+
+        if context[
+            "is_platform_admin"
+        ]:
+
+            menu += (
+
+                "\n\n━━━━━━━━━━━━━━\n\n"
+
+                "🔐 *ADMINISTRAÇÃO*\n\n"
+
+                "👥 listar clientes\n\n"
+
+                "➕ cadastrar cliente"
+            )
+
+
         send_whatsapp_message(
             sender,
-            (
-                f"🤖 *ASSISTENTE META ADS*\n\n"
-
-                f"Empresa: "
-                f"*{context['company_name']}*\n\n"
-
-                "*Comandos:*\n\n"
-
-                "👤 quem sou eu\n\n"
-
-                "📊 gasto últimos 7 dias\n\n"
-
-                "🤖 analise meus últimos 7 dias\n\n"
-
-                "🔧 criar campanha teste"
-            )
+            menu
         )
 
 
