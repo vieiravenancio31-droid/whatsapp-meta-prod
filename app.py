@@ -15,7 +15,7 @@ app = Flask(__name__)
 
 
 # =========================================================
-# VARIÁVEIS
+# VARIÁVEIS DE AMBIENTE
 # =========================================================
 
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
@@ -27,7 +27,10 @@ META_ADS_ACCESS_TOKEN = os.getenv("META_ADS_ACCESS_TOKEN")
 META_AD_ACCOUNT_ID = os.getenv("META_AD_ACCOUNT_ID")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
+OPENAI_MODEL = os.getenv(
+    "OPENAI_MODEL",
+    "gpt-5.6-luna"
+)
 
 ADMIN_WHATSAPP_NUMBER = os.getenv("ADMIN_WHATSAPP_NUMBER")
 
@@ -47,7 +50,7 @@ openai_client = OpenAI(
 
 
 # =========================================================
-# HOME
+# HOME / HEALTH CHECK
 # =========================================================
 
 @app.route("/", methods=["GET"])
@@ -56,13 +59,14 @@ def home():
     return {
         "status": "online",
         "service": "whatsapp-meta-prod",
-        "meta_ads": "read_and_write_paused_test",
+        "meta_ads": "read_and_write",
+        "campaign_creation": "paused_only",
         "openai": "configured"
     }, 200
 
 
 # =========================================================
-# VERIFICAÇÃO WEBHOOK
+# VERIFICAÇÃO DO WEBHOOK
 # =========================================================
 
 @app.route("/webhook", methods=["GET"])
@@ -158,7 +162,7 @@ def send_whatsapp_message(to, text):
     )
 
     print(
-        "Resposta WhatsApp:",
+        "RESPOSTA WHATSAPP:",
         response.status_code,
         response.text
     )
@@ -167,7 +171,7 @@ def send_whatsapp_message(to, text):
 
 
 # =========================================================
-# LEADS
+# IDENTIFICAÇÃO DE LEADS
 # =========================================================
 
 def get_leads(actions):
@@ -182,7 +186,10 @@ def get_leads(actions):
         action_type = item.get("action_type")
 
         try:
-            value = float(item.get("value", 0))
+            value = float(
+                item.get("value", 0)
+            )
+
         except (TypeError, ValueError):
             value = 0
 
@@ -217,7 +224,12 @@ def get_last_7_days_report():
 
     params = {
         "access_token": META_ADS_ACCESS_TOKEN,
-        "fields": "spend,impressions,clicks,actions",
+        "fields": (
+            "spend,"
+            "impressions,"
+            "clicks,"
+            "actions"
+        ),
         "date_preset": "last_7d",
         "level": "account"
     }
@@ -229,7 +241,7 @@ def get_last_7_days_report():
     )
 
     print(
-        "Resposta Meta Ads:",
+        "RESPOSTA META ADS:",
         response.status_code,
         response.text
     )
@@ -252,15 +264,26 @@ def get_last_7_days_report():
 
     row = result["data"][0]
 
-    spend = float(row.get("spend", 0))
-    impressions = int(row.get("impressions", 0))
-    clicks = int(row.get("clicks", 0))
+    spend = float(
+        row.get("spend", 0)
+    )
+
+    impressions = int(
+        row.get("impressions", 0)
+    )
+
+    clicks = int(
+        row.get("clicks", 0)
+    )
 
     leads = get_leads(
         row.get("actions", [])
     )
 
-    cpl = spend / leads if leads > 0 else 0
+    if leads > 0:
+        cpl = spend / leads
+    else:
+        cpl = 0
 
     return {
         "spend": spend,
@@ -272,7 +295,7 @@ def get_last_7_days_report():
 
 
 # =========================================================
-# META ADS — CRIAÇÃO DE CAMPANHA DE TESTE
+# META ADS — CRIAÇÃO DE CAMPANHA
 # =========================================================
 
 def create_test_campaign():
@@ -289,10 +312,23 @@ def create_test_campaign():
 
     payload = {
         "name": "TESTE API WHATSAPP - NAO ATIVAR",
+
         "objective": "OUTCOME_TRAFFIC",
-        "status": "PAUSED",
+
         "buying_type": "AUCTION",
-        "special_ad_categories": json.dumps([])
+
+        # A campanha sempre nasce pausada.
+        "status": "PAUSED",
+
+        # Não é campanha de categoria especial.
+        "special_ad_categories": json.dumps([]),
+
+        # IMPORTANTE:
+        # obrigatório para esse cenário na API atual.
+        #
+        # false = não haverá compartilhamento
+        # automático de orçamento entre conjuntos.
+        "is_adset_budget_sharing_enabled": "false"
     }
 
     response = requests.post(
@@ -314,11 +350,20 @@ def create_test_campaign():
 
     result = response.json()
 
-    return result.get("id"), None
+    campaign_id = result.get("id")
+
+    if not campaign_id:
+
+        return None, (
+            "Meta retornou sucesso, "
+            "mas não retornou ID da campanha."
+        )
+
+    return campaign_id, None
 
 
 # =========================================================
-# OPENAI
+# OPENAI — ANÁLISE
 # =========================================================
 
 def analyze_meta_report(
@@ -359,27 +404,43 @@ R$ {report['cpl']:.2f}
         instructions="""
 Você é um analista sênior especializado em Meta Ads.
 
-Analise exclusivamente os dados fornecidos.
+Você está analisando dados reais de uma conta de anúncios.
 
-Nunca invente números, campanhas,
-anúncios ou causas não comprovadas.
+REGRAS:
 
-Responda em português do Brasil.
+1. Analise exclusivamente os dados fornecidos.
+2. Nunca invente números.
+3. Nunca invente campanhas.
+4. Nunca invente anúncios.
+5. Nunca invente conjuntos.
+6. Nunca invente causas que os dados não comprovam.
+7. Diferencie fatos de hipóteses.
+8. Se não houver informação suficiente, diga claramente.
+9. Não recomende aumento de orçamento sem evidência.
+10. Responda em português do Brasil.
 
-Estruture em:
+A resposta será enviada por WhatsApp.
+
+Seja direto e organizado.
+
+Estrutura:
 
 📊 RESUMO
+
 ✅ PONTOS POSITIVOS
+
 ⚠️ PONTOS DE ATENÇÃO
+
 🎯 PRÓXIMA AÇÃO
 """,
 
         input=f"""
-PERGUNTA:
+PERGUNTA DO USUÁRIO:
 
 {user_question}
 
-DADOS:
+
+DADOS REAIS DO META ADS:
 
 {dados}
 """
@@ -389,7 +450,7 @@ DADOS:
 
 
 # =========================================================
-# RELATÓRIO
+# RELATÓRIO BÁSICO
 # =========================================================
 
 def build_basic_report(report):
@@ -419,13 +480,16 @@ def build_basic_report(report):
 
     else:
 
-        text += "💵 CPL: sem leads registrados"
+        text += (
+            "💵 CPL: "
+            "sem leads registrados"
+        )
 
     return text
 
 
 # =========================================================
-# WEBHOOK
+# WEBHOOK — RECEBIMENTO
 # =========================================================
 
 @app.route("/webhook", methods=["POST"])
@@ -436,7 +500,7 @@ def receive_webhook():
     ) or {}
 
     print(
-        "Webhook recebido:",
+        "WEBHOOK RECEBIDO:",
         data
     )
 
@@ -448,14 +512,23 @@ def receive_webhook():
             ["value"]
         )
 
+        # A Meta também manda atualizações de:
+        # entregue
+        # lido
+        # enviado
+        #
+        # Esses eventos não possuem "messages".
         messages = value.get("messages")
 
         if not messages:
+
             return "EVENT_RECEIVED", 200
 
         message = messages[0]
 
+        # Por enquanto trabalhamos apenas com texto.
         if message.get("type") != "text":
+
             return "EVENT_RECEIVED", 200
 
         sender = message["from"]
@@ -470,62 +543,18 @@ def receive_webhook():
         )
 
         print(
-            "Mensagem:",
+            "MENSAGEM RECEBIDA:",
             original_text
+        )
+
+        print(
+            "REMETENTE:",
+            sender
         )
 
 
         # =================================================
-        # CONFIRMAÇÃO DE CRIAÇÃO
-        # =================================================
-
-        if received_text == "confirmar campanha teste":
-
-            if sender != ADMIN_WHATSAPP_NUMBER:
-
-                send_whatsapp_message(
-                    sender,
-                    "⛔ Você não tem autorização "
-                    "para criar campanhas."
-                )
-
-                return "EVENT_RECEIVED", 200
-
-            send_whatsapp_message(
-                sender,
-                "Criando campanha PAUSADA..."
-            )
-
-            campaign_id, error = create_test_campaign()
-
-            if error:
-
-                send_whatsapp_message(
-                    sender,
-                    "❌ Não consegui criar a campanha.\n\n"
-                    "Verifique os logs do Railway."
-                )
-
-                return "EVENT_RECEIVED", 200
-
-            send_whatsapp_message(
-                sender,
-                (
-                    "✅ *CAMPANHA CRIADA*\n\n"
-                    "Nome:\n"
-                    "TESTE API WHATSAPP - NAO ATIVAR\n\n"
-                    "Status: PAUSADA\n"
-                    "Objetivo: Tráfego\n\n"
-                    f"ID: {campaign_id}\n\n"
-                    "Nenhum conjunto ou anúncio foi criado."
-                )
-            )
-
-            return "EVENT_RECEIVED", 200
-
-
-        # =================================================
-        # SOLICITAÇÃO DE CRIAÇÃO
+        # CRIAR CAMPANHA — ETAPA DE SOLICITAÇÃO
         # =================================================
 
         if received_text == "criar campanha teste":
@@ -534,8 +563,11 @@ def receive_webhook():
 
                 send_whatsapp_message(
                     sender,
-                    "⛔ Comandos de criação estão "
-                    "restritos ao administrador."
+                    (
+                        "⛔ *ACESSO NEGADO*\n\n"
+                        "Comandos de criação de campanhas "
+                        "estão restritos ao administrador."
+                    )
                 )
 
                 return "EVENT_RECEIVED", 200
@@ -545,19 +577,33 @@ def receive_webhook():
                 (
                     "⚠️ *CONFIRMAÇÃO NECESSÁRIA*\n\n"
 
-                    "Será criada uma campanha:\n\n"
+                    "Será criada uma campanha no Meta Ads.\n\n"
 
-                    "Nome:\n"
+                    "*Nome:*\n"
                     "TESTE API WHATSAPP - NAO ATIVAR\n\n"
 
-                    "Objetivo: Tráfego\n"
-                    "Status: PAUSADA\n"
-                    "Conjuntos: nenhum\n"
-                    "Anúncios: nenhum\n\n"
+                    "*Objetivo:*\n"
+                    "Tráfego\n\n"
 
-                    "Ela NÃO ficará veiculando.\n\n"
+                    "*Compra:*\n"
+                    "Leilão\n\n"
 
-                    "Para criar, responda exatamente:\n\n"
+                    "*Status:*\n"
+                    "PAUSADA\n\n"
+
+                    "*Orçamento:*\n"
+                    "Nenhum\n\n"
+
+                    "*Conjuntos:*\n"
+                    "Nenhum\n\n"
+
+                    "*Anúncios:*\n"
+                    "Nenhum\n\n"
+
+                    "⚠️ A campanha NÃO ficará veiculando "
+                    "e NÃO terá orçamento configurado.\n\n"
+
+                    "Para continuar, responda exatamente:\n\n"
 
                     "*CONFIRMAR CAMPANHA TESTE*"
                 )
@@ -567,7 +613,84 @@ def receive_webhook():
 
 
         # =================================================
-        # GASTO 7 DIAS
+        # CRIAR CAMPANHA — CONFIRMAÇÃO
+        # =================================================
+
+        if received_text == "confirmar campanha teste":
+
+            if sender != ADMIN_WHATSAPP_NUMBER:
+
+                send_whatsapp_message(
+                    sender,
+                    (
+                        "⛔ *ACESSO NEGADO*\n\n"
+                        "Você não possui autorização "
+                        "para criar campanhas."
+                    )
+                )
+
+                return "EVENT_RECEIVED", 200
+
+
+            send_whatsapp_message(
+                sender,
+                "⏳ Criando campanha PAUSADA no Meta Ads..."
+            )
+
+
+            campaign_id, error = create_test_campaign()
+
+
+            if error:
+
+                print(
+                    "ERRO AO CRIAR CAMPANHA:",
+                    error
+                )
+
+                send_whatsapp_message(
+                    sender,
+                    (
+                        "❌ *NÃO CONSEGUI CRIAR A CAMPANHA*\n\n"
+                        "A Meta recusou a operação.\n\n"
+                        "Verifique os logs do Railway."
+                    )
+                )
+
+                return "EVENT_RECEIVED", 200
+
+
+            send_whatsapp_message(
+                sender,
+                (
+                    "✅ *CAMPANHA CRIADA COM SUCESSO*\n\n"
+
+                    "*Nome:*\n"
+                    "TESTE API WHATSAPP - NAO ATIVAR\n\n"
+
+                    "*Objetivo:*\n"
+                    "Tráfego\n\n"
+
+                    "*Status:*\n"
+                    "PAUSADA\n\n"
+
+                    f"*Campaign ID:*\n"
+                    f"{campaign_id}\n\n"
+
+                    "Nenhum conjunto foi criado.\n"
+                    "Nenhum anúncio foi criado.\n"
+                    "Nenhum orçamento foi configurado.\n\n"
+
+                    "✅ Portanto, não há possibilidade "
+                    "de começar a gastar."
+                )
+            )
+
+            return "EVENT_RECEIVED", 200
+
+
+        # =================================================
+        # RELATÓRIO — ÚLTIMOS 7 DIAS
         # =================================================
 
         if (
@@ -580,27 +703,44 @@ def receive_webhook():
                 "Consultando sua conta de anúncios..."
             )
 
-            report, error = get_last_7_days_report()
+            report, error = (
+                get_last_7_days_report()
+            )
 
             if error:
 
+                print(
+                    "ERRO META ADS:",
+                    error
+                )
+
                 send_whatsapp_message(
                     sender,
-                    "Não consegui consultar o Meta Ads."
+                    (
+                        "Não consegui consultar "
+                        "os dados do Meta Ads."
+                    )
                 )
 
                 return "EVENT_RECEIVED", 200
 
+
+            resposta = build_basic_report(
+                report
+            )
+
+
             send_whatsapp_message(
                 sender,
-                build_basic_report(report)
+                resposta
             )
+
 
             return "EVENT_RECEIVED", 200
 
 
         # =================================================
-        # ANÁLISE IA
+        # ANÁLISE COM IA
         # =================================================
 
         if (
@@ -610,19 +750,38 @@ def receive_webhook():
 
             send_whatsapp_message(
                 sender,
-                "Consultando os dados..."
+                "Consultando os dados do Meta Ads..."
             )
 
-            report, error = get_last_7_days_report()
+
+            report, error = (
+                get_last_7_days_report()
+            )
+
 
             if error:
 
+                print(
+                    "ERRO META ADS:",
+                    error
+                )
+
                 send_whatsapp_message(
                     sender,
-                    "Não consegui consultar o Meta Ads."
+                    (
+                        "Não consegui consultar "
+                        "os dados da conta."
+                    )
                 )
 
                 return "EVENT_RECEIVED", 200
+
+
+            send_whatsapp_message(
+                sender,
+                "Dados encontrados. Analisando..."
+            )
+
 
             try:
 
@@ -631,22 +790,30 @@ def receive_webhook():
                     original_text
                 )
 
+
                 send_whatsapp_message(
                     sender,
                     analysis
                 )
 
+
             except Exception as e:
 
                 print(
-                    "Erro OpenAI:",
+                    "ERRO OPENAI:",
                     repr(e)
                 )
 
                 send_whatsapp_message(
                     sender,
-                    "Erro ao gerar análise com IA."
+                    (
+                        "Os dados do Meta Ads foram "
+                        "consultados corretamente, "
+                        "mas ocorreu um erro "
+                        "na análise com IA."
+                    )
                 )
+
 
             return "EVENT_RECEIVED", 200
 
@@ -658,15 +825,19 @@ def receive_webhook():
         send_whatsapp_message(
             sender,
             (
-                "🤖 *Assistente Meta Ads*\n\n"
+                "🤖 *ASSISTENTE META ADS*\n\n"
 
-                "Testes disponíveis:\n\n"
+                "*Consultas disponíveis:*\n\n"
 
-                "📊 *gasto últimos 7 dias*\n"
-                "🤖 *analise meus últimos 7 dias*\n\n"
+                "📊 gasto últimos 7 dias\n\n"
 
-                "🔧 Administrador:\n"
-                "*criar campanha teste*"
+                "🤖 analise meus últimos 7 dias\n\n"
+
+                "━━━━━━━━━━━━━━\n\n"
+
+                "🔐 *ADMINISTRADOR*\n\n"
+
+                "criar campanha teste"
             )
         )
 
@@ -674,9 +845,10 @@ def receive_webhook():
     except Exception as e:
 
         print(
-            "Erro webhook:",
+            "ERRO AO PROCESSAR WEBHOOK:",
             repr(e)
         )
+
 
     return "EVENT_RECEIVED", 200
 
