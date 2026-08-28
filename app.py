@@ -27,7 +27,7 @@ from psycopg.rows import dict_row
 
 app = Flask(__name__)
 
-BUILD_ID = "dynamic-analysis-v3-2026-08-27"
+BUILD_ID = "dynamic-analysis-v7-deterministic-whatsapp-2026-08-27"
 print("BOOT BUILD_ID:", BUILD_ID)
 
 
@@ -1059,6 +1059,27 @@ def home():
     }, 200
 
 
+@app.route("/format-test", methods=["GET"])
+def format_test():
+    raw = """### **📊 RESUMO**
+**Investimento:** R$ 12.450
+**Leads:** 184
+**CPL:** R$ 67,66
+
+## ✅ PONTOS POSITIVOS
+- A campanha **Imersão** melhorou.
+
+### ⚠️ PONTOS DE ATENÇÃO
+* A campanha Sul concentrou gasto.
+
+### 🎯 PRÓXIMA AÇÃO
+Investigue os anúncios da campanha Sul."""
+    return {
+        "build_id": BUILD_ID,
+        "formatted": clean_ai_text_for_whatsapp(raw),
+    }, 200
+
+
 @app.route("/db-check", methods=["GET"])
 def database_check():
     try:
@@ -1303,7 +1324,177 @@ def send_whatsapp_message(to, text):
     return response
 
 
+def clean_ai_text_for_whatsapp(text):
+    """
+    Formata respostas analíticas para WhatsApp de forma DETERMINÍSTICA.
+
+    Regra desta versão:
+    - nenhum #;
+    - nenhum *;
+    - nenhum **;
+    - nenhum bloco de código;
+    - nenhuma tabela Markdown;
+    - títulos com emoji + MAIÚSCULAS;
+    - listas com •;
+    - espaçamento curto e consistente.
+
+    Assim, a apresentação final não depende da OpenAI obedecer ao prompt.
+    """
+    text = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return ""
+
+    # Remove cercas e links Markdown, preservando o conteúdo útil.
+    text = re.sub(r"```(?:[a-zA-Z0-9_+.-]+)?\s*", "", text)
+    text = text.replace("```", "")
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1: \2", text)
+
+    section_emojis = {
+        "resumo": "📊",
+        "visao geral": "📊",
+        "resultado": "📊",
+        "resultados": "📊",
+        "comparacao": "📊",
+        "comparativo": "📊",
+        "metricas": "📈",
+        "principais metricas": "📈",
+        "pontos positivos": "✅",
+        "ponto positivo": "✅",
+        "melhor sinal": "✅",
+        "destaques positivos": "✅",
+        "o que melhorou": "✅",
+        "pontos de atencao": "⚠️",
+        "ponto de atencao": "⚠️",
+        "atencao": "⚠️",
+        "alerta": "⚠️",
+        "alertas": "⚠️",
+        "problemas": "⚠️",
+        "riscos": "⚠️",
+        "o que piorou": "⚠️",
+        "proxima acao": "🎯",
+        "proximas acoes": "🎯",
+        "recomendacao": "🎯",
+        "recomendacoes": "🎯",
+        "o que fazer": "🎯",
+        "prioridade": "🎯",
+        "prioridades": "🎯",
+        "campanhas": "📣",
+        "anuncios": "🧩",
+        "conjuntos": "🧩",
+        "conjuntos de anuncios": "🧩",
+        "conclusao": "🧠",
+        "diagnostico": "🧠",
+    }
+
+    def strip_markup(value):
+        value = value.strip()
+        value = re.sub(r"^>+\s*", "", value)
+        value = re.sub(r"^#{1,6}\s*", "", value)
+        value = re.sub(r"\s*#+$", "", value)
+        value = value.replace("**", "")
+        value = value.replace("__", "")
+        value = value.replace("~~", "")
+        value = value.replace("`", "")
+        value = value.replace("*", "")
+        # Remove apenas underscores usados como ênfase; não mexe em URLs/IDs inteiros.
+        value = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"\1", value)
+        value = re.sub(r"[ \t]{2,}", " ", value)
+        return value.strip()
+
+    def normalize_key(value):
+        value = strip_markup(value)
+        value = re.sub(r"^[^\wÀ-ÿ]+", "", value)
+        value = re.sub(r"[^\wÀ-ÿ]+$", "", value)
+        normalized = unicodedata.normalize("NFD", value.lower())
+        normalized = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+        return re.sub(r"\s+", " ", normalized).strip()
+
+    def split_emoji(value):
+        match = re.match(r"^([\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0F]+)\s*", value)
+        if not match:
+            return None, value
+        return match.group(1).strip(), value[match.end():].strip()
+
+    lines = []
+    for raw in text.split("\n"):
+        raw = raw.strip()
+        if not raw:
+            lines.append("")
+            continue
+
+        # Descarta separadores e linha de separação de tabela Markdown.
+        if re.fullmatch(r"[-*_~| ]{3,}", raw):
+            continue
+        if re.fullmatch(r"\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?", raw):
+            continue
+
+        # Tabelas simples viram texto legível.
+        if "|" in raw:
+            cells = [strip_markup(c) for c in raw.strip("|").split("|")]
+            cells = [c for c in cells if c]
+            if len(cells) == 2:
+                raw = f"{cells[0]}: {cells[1]}"
+            elif len(cells) > 2:
+                raw = " • ".join(cells)
+
+        # Lista Markdown/numerada -> bullet único.
+        if re.match(r"^(?:[-+*•·]|\d+[.)])\s+", raw):
+            body = re.sub(r"^(?:[-+*•·]|\d+[.)])\s+", "", raw)
+            body = strip_markup(body)
+            if body:
+                lines.append(f"• {body}")
+            continue
+
+        was_heading = bool(re.match(r"^#{1,6}\s*", raw))
+        cleaned = strip_markup(raw)
+        if not cleaned:
+            continue
+
+        existing_emoji, title_candidate = split_emoji(cleaned)
+        title_candidate = title_candidate.rstrip(":").strip()
+        key = normalize_key(title_candidate)
+        is_upper_heading = (
+            len(title_candidate) <= 60
+            and len(title_candidate.split()) <= 8
+            and any(ch.isalpha() for ch in title_candidate)
+            and title_candidate.upper() == title_candidate
+        )
+        is_known_heading = key in section_emojis
+
+        if was_heading or is_known_heading or (existing_emoji and is_upper_heading):
+            emoji = existing_emoji or section_emojis.get(key, "")
+            title = title_candidate.upper()
+            lines.append(f"{emoji + ' ' if emoji else ''}{title}")
+            continue
+
+        cleaned = re.sub(r"^[•·]\s*", "", cleaned)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+        if cleaned:
+            lines.append(cleaned)
+
+    # Colapsa linhas vazias duplicadas.
+    compact = []
+    previous_blank = False
+    for line in lines:
+        blank = not line.strip()
+        if blank and previous_blank:
+            continue
+        compact.append(line)
+        previous_blank = blank
+
+    result = "\n".join(compact).strip()
+
+    # Trava final: a resposta analítica enviada ao WhatsApp não pode conter
+    # os marcadores que estavam poluindo a mensagem.
+    result = result.replace("#", "")
+    result = result.replace("*", "")
+    result = result.replace("```", "")
+    result = re.sub(r"\n{3,}", "\n\n", result)
+
+    return result.strip()
+
 def send_whatsapp_long_message(to, text, max_chars=3500):
+    text = clean_ai_text_for_whatsapp(text)
     text = str(text or "").strip()
     if not text:
         return []
@@ -2304,14 +2495,36 @@ REGRAS ABSOLUTAS:
 - Se a pergunta não for sobre Meta Ads, explique brevemente o escopo e ofereça exemplos do que pode analisar.
 - Se não houver dados, diga explicitamente que a Meta não retornou dados para aquele recorte.
 
-FORMATO:
-Adapte o formato à pergunta. Em análises, prefira:
-📊 Resumo
-✅ O que melhorou
-⚠️ O que piorou / atenção
-🔎 Onde está o impacto
-🎯 Próxima ação
-Não force todas as seções quando uma resposta curta for suficiente.
+FORMATO PARA WHATSAPP — REGRA ABSOLUTA:
+- NÃO use nenhum caractere de Markdown para formatar a resposta.
+- NÃO use #, ##, ###, *, **, _, __, crases, tabelas ou blocos de código.
+- Títulos devem ser texto puro em MAIÚSCULAS, com no máximo um emoji no início.
+- Use poucos blocos e parágrafos curtos.
+- Para listas, uma ideia por linha, sem hífen ou asterisco no início; o backend transforma em bullet quando necessário.
+- Para métricas, prefira uma métrica por linha: Investimento: R$ 10.000 / Leads: 100 / CPL: R$ 100.
+- Evite repetir a mesma conclusão em blocos diferentes.
+- Se a pergunta for simples, responda curto. Se exigir análise, desenvolva somente o necessário.
+- O backend fará uma sanitização determinística antes do envio, então não tente aplicar negrito/itálico.
+
+ESTILO DE CONTEÚDO DESEJADO:
+RESUMO
+O investimento aumentou, mas o crescimento de leads foi proporcionalmente menor. Isso pressionou o CPL.
+
+Investimento: R$ 12.450
+Leads: 184
+CPL: R$ 67,66
+
+PONTOS POSITIVOS
+A campanha Imersão ganhou volume mantendo boa eficiência.
+
+PONTOS DE ATENÇÃO
+A campanha Sul concentrou gasto sem acompanhar o crescimento de conversões.
+
+PRÓXIMA AÇÃO
+Aprofunde primeiro nos anúncios da campanha Sul que mais gastaram sem gerar leads.
+
+IMPORTANTE: não use #, ##, ###, ** ou tabelas. O backend aplicará o destaque final.
+Adapte o tamanho e os blocos à pergunta; não force todas as seções quando não forem necessárias.
 """
 
 
@@ -2431,6 +2644,7 @@ def run_dynamic_openai_analysis(context, user_question):
             if not final_text:
                 raise RuntimeError("OpenAI não retornou texto final.")
             save_ai_conversation_state(context, response.id)
+            final_text = clean_ai_text_for_whatsapp(final_text)
             return final_text, response.id
 
         print(
@@ -2580,7 +2794,16 @@ def process_dynamic_analysis(sender, user_id, original_text):
             },
         )
 
-        send_whatsapp_long_message(sender, answer)
+        formatted_answer = clean_ai_text_for_whatsapp(answer)
+        print(
+            "[DYNAMIC] FORMAT_CHECK",
+            {
+                "contains_hash": "#" in formatted_answer,
+                "contains_asterisk": "*" in formatted_answer,
+                "chars": len(formatted_answer),
+            },
+        )
+        send_whatsapp_long_message(sender, formatted_answer)
         print("[DYNAMIC] JOB_DONE")
 
     except Exception as error:
@@ -2650,7 +2873,14 @@ Nunca invente números, campanhas, anúncios, conjuntos ou causas.
 Diferencie fatos de hipóteses.
 Responda em português do Brasil.
 
-Estruture em:
+FORMATO PARA WHATSAPP:
+- Use TEXTO PURO, sem Markdown.
+- Não use #, *, _, `, >, |, tabelas ou cercas de código.
+- Destaque blocos apenas com emoji + título curto em MAIÚSCULAS.
+- Use • somente quando realmente houver uma lista.
+- Mantenha a resposta limpa, compacta e fácil de escanear.
+
+Quando fizer sentido, organize em:
 📊 RESUMO
 ✅ PONTOS POSITIVOS
 ⚠️ PONTOS DE ATENÇÃO
@@ -2665,12 +2895,12 @@ DADOS:
 """,
     )
 
-    return response.output_text
+    return clean_ai_text_for_whatsapp(response.output_text)
 
 
 def build_basic_report(report):
     text = (
-        "📊 *META ADS — ÚLTIMOS 7 DIAS*\n\n"
+        "📊 META ADS — ÚLTIMOS 7 DIAS\n\n"
         f"💰 Investimento: {format_brl(report['spend'])}\n"
         f"👁 Impressões: {format_number(report['impressions'])}\n"
         f"🖱 Cliques: {format_number(report['clicks'])}\n"
