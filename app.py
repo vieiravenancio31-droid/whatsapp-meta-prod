@@ -27,7 +27,7 @@ from psycopg.rows import dict_row
 
 app = Flask(__name__)
 
-BUILD_ID = "dynamic-analysis-v9.1-meta-driven-2026-08-28"
+BUILD_ID = "dynamic-analysis-v3-2026-08-27"
 print("BOOT BUILD_ID:", BUILD_ID)
 
 
@@ -53,18 +53,6 @@ TOKEN_ENCRYPTION_KEY = os.getenv("TOKEN_ENCRYPTION_KEY")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
-
-# O motor dinâmico pode usar um modelo mais forte sem alterar o modelo legado.
-# Para custo/qualidade, Terra é o padrão da v8; pode ser sobrescrito no Railway.
-OPENAI_ANALYSIS_MODEL = os.getenv("OPENAI_ANALYSIS_MODEL", "gpt-5.6-terra")
-OPENAI_ANALYSIS_REASONING_EFFORT = os.getenv(
-    "OPENAI_ANALYSIS_REASONING_EFFORT",
-    "medium",
-).strip().lower()
-if OPENAI_ANALYSIS_REASONING_EFFORT not in {
-    "none", "low", "medium", "high", "xhigh", "max"
-}:
-    OPENAI_ANALYSIS_REASONING_EFFORT = "medium"
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_WHATSAPP_NUMBER = os.getenv("ADMIN_WHATSAPP_NUMBER")
@@ -1068,31 +1056,6 @@ def home():
         "architecture": "multi_company_oauth_v1",
         "build_id": BUILD_ID,
         "dynamic_analysis": "enabled",
-        "analysis_engine": "meta_driven_v9_1",
-        "objective_aware": "meta_driven",
-        "analysis_model": OPENAI_ANALYSIS_MODEL,
-        "analysis_reasoning_effort": OPENAI_ANALYSIS_REASONING_EFFORT,
-    }, 200
-
-
-@app.route("/format-test", methods=["GET"])
-def format_test():
-    raw = """### **📊 RESUMO**
-**Investimento:** R$ 12.450
-**Leads:** 184
-**CPL:** R$ 67,66
-
-## ✅ PONTOS POSITIVOS
-- A campanha **Imersão** melhorou.
-
-### ⚠️ PONTOS DE ATENÇÃO
-* A campanha Sul concentrou gasto.
-
-### 🎯 PRÓXIMA AÇÃO
-Investigue os anúncios da campanha Sul."""
-    return {
-        "build_id": BUILD_ID,
-        "formatted": clean_ai_text_for_whatsapp(raw),
     }, 200
 
 
@@ -1340,177 +1303,7 @@ def send_whatsapp_message(to, text):
     return response
 
 
-def clean_ai_text_for_whatsapp(text):
-    """
-    Formata respostas analíticas para WhatsApp de forma DETERMINÍSTICA.
-
-    Regra desta versão:
-    - nenhum #;
-    - nenhum *;
-    - nenhum **;
-    - nenhum bloco de código;
-    - nenhuma tabela Markdown;
-    - títulos com emoji + MAIÚSCULAS;
-    - listas com •;
-    - espaçamento curto e consistente.
-
-    Assim, a apresentação final não depende da OpenAI obedecer ao prompt.
-    """
-    text = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    if not text:
-        return ""
-
-    # Remove cercas e links Markdown, preservando o conteúdo útil.
-    text = re.sub(r"```(?:[a-zA-Z0-9_+.-]+)?\s*", "", text)
-    text = text.replace("```", "")
-    text = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1: \2", text)
-
-    section_emojis = {
-        "resumo": "📊",
-        "visao geral": "📊",
-        "resultado": "📊",
-        "resultados": "📊",
-        "comparacao": "📊",
-        "comparativo": "📊",
-        "metricas": "📈",
-        "principais metricas": "📈",
-        "pontos positivos": "✅",
-        "ponto positivo": "✅",
-        "melhor sinal": "✅",
-        "destaques positivos": "✅",
-        "o que melhorou": "✅",
-        "pontos de atencao": "⚠️",
-        "ponto de atencao": "⚠️",
-        "atencao": "⚠️",
-        "alerta": "⚠️",
-        "alertas": "⚠️",
-        "problemas": "⚠️",
-        "riscos": "⚠️",
-        "o que piorou": "⚠️",
-        "proxima acao": "🎯",
-        "proximas acoes": "🎯",
-        "recomendacao": "🎯",
-        "recomendacoes": "🎯",
-        "o que fazer": "🎯",
-        "prioridade": "🎯",
-        "prioridades": "🎯",
-        "campanhas": "📣",
-        "anuncios": "🧩",
-        "conjuntos": "🧩",
-        "conjuntos de anuncios": "🧩",
-        "conclusao": "🧠",
-        "diagnostico": "🧠",
-    }
-
-    def strip_markup(value):
-        value = value.strip()
-        value = re.sub(r"^>+\s*", "", value)
-        value = re.sub(r"^#{1,6}\s*", "", value)
-        value = re.sub(r"\s*#+$", "", value)
-        value = value.replace("**", "")
-        value = value.replace("__", "")
-        value = value.replace("~~", "")
-        value = value.replace("`", "")
-        value = value.replace("*", "")
-        # Remove apenas underscores usados como ênfase; não mexe em URLs/IDs inteiros.
-        value = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"\1", value)
-        value = re.sub(r"[ \t]{2,}", " ", value)
-        return value.strip()
-
-    def normalize_key(value):
-        value = strip_markup(value)
-        value = re.sub(r"^[^\wÀ-ÿ]+", "", value)
-        value = re.sub(r"[^\wÀ-ÿ]+$", "", value)
-        normalized = unicodedata.normalize("NFD", value.lower())
-        normalized = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
-        return re.sub(r"\s+", " ", normalized).strip()
-
-    def split_emoji(value):
-        match = re.match(r"^([\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0F]+)\s*", value)
-        if not match:
-            return None, value
-        return match.group(1).strip(), value[match.end():].strip()
-
-    lines = []
-    for raw in text.split("\n"):
-        raw = raw.strip()
-        if not raw:
-            lines.append("")
-            continue
-
-        # Descarta separadores e linha de separação de tabela Markdown.
-        if re.fullmatch(r"[-*_~| ]{3,}", raw):
-            continue
-        if re.fullmatch(r"\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?", raw):
-            continue
-
-        # Tabelas simples viram texto legível.
-        if "|" in raw:
-            cells = [strip_markup(c) for c in raw.strip("|").split("|")]
-            cells = [c for c in cells if c]
-            if len(cells) == 2:
-                raw = f"{cells[0]}: {cells[1]}"
-            elif len(cells) > 2:
-                raw = " • ".join(cells)
-
-        # Lista Markdown/numerada -> bullet único.
-        if re.match(r"^(?:[-+*•·]|\d+[.)])\s+", raw):
-            body = re.sub(r"^(?:[-+*•·]|\d+[.)])\s+", "", raw)
-            body = strip_markup(body)
-            if body:
-                lines.append(f"• {body}")
-            continue
-
-        was_heading = bool(re.match(r"^#{1,6}\s*", raw))
-        cleaned = strip_markup(raw)
-        if not cleaned:
-            continue
-
-        existing_emoji, title_candidate = split_emoji(cleaned)
-        title_candidate = title_candidate.rstrip(":").strip()
-        key = normalize_key(title_candidate)
-        is_upper_heading = (
-            len(title_candidate) <= 60
-            and len(title_candidate.split()) <= 8
-            and any(ch.isalpha() for ch in title_candidate)
-            and title_candidate.upper() == title_candidate
-        )
-        is_known_heading = key in section_emojis
-
-        if was_heading or is_known_heading or (existing_emoji and is_upper_heading):
-            emoji = existing_emoji or section_emojis.get(key, "")
-            title = title_candidate.upper()
-            lines.append(f"{emoji + ' ' if emoji else ''}{title}")
-            continue
-
-        cleaned = re.sub(r"^[•·]\s*", "", cleaned)
-        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
-        if cleaned:
-            lines.append(cleaned)
-
-    # Colapsa linhas vazias duplicadas.
-    compact = []
-    previous_blank = False
-    for line in lines:
-        blank = not line.strip()
-        if blank and previous_blank:
-            continue
-        compact.append(line)
-        previous_blank = blank
-
-    result = "\n".join(compact).strip()
-
-    # Trava final: a resposta analítica enviada ao WhatsApp não pode conter
-    # os marcadores que estavam poluindo a mensagem.
-    result = result.replace("#", "")
-    result = result.replace("*", "")
-    result = result.replace("```", "")
-    result = re.sub(r"\n{3,}", "\n\n", result)
-
-    return result.strip()
-
 def send_whatsapp_long_message(to, text, max_chars=3500):
-    text = clean_ai_text_for_whatsapp(text)
     text = str(text or "").strip()
     if not text:
         return []
@@ -1681,9 +1474,6 @@ ALLOWED_SORT_METRICS = {
     "cpl",
     "landing_page_views",
     "cost_per_landing_page_view",
-    "lpv_rate_from_link_clicks",
-    "lead_rate_from_lpv",
-    "lead_rate_from_link_clicks",
 }
 
 
@@ -1771,14 +1561,6 @@ def get_landing_page_views(actions):
     )
 
 
-def safe_rate(numerator, denominator, multiplier=100):
-    numerator = safe_float(numerator)
-    denominator = safe_float(denominator)
-    if denominator <= 0:
-        return 0
-    return metric_round((numerator / denominator) * multiplier, 4)
-
-
 def build_metrics(spend, impressions, reach, clicks, link_clicks, leads, lpv):
     spend = safe_float(spend)
     impressions = safe_int(impressions)
@@ -1795,8 +1577,11 @@ def build_metrics(spend, impressions, reach, clicks, link_clicks, leads, lpv):
         "frequency": metric_round(impressions / reach if reach else 0, 4),
         "clicks": clicks,
         "link_clicks": link_clicks,
-        "ctr": safe_rate(clicks, impressions),
-        "link_ctr": safe_rate(link_clicks, impressions),
+        "ctr": metric_round((clicks / impressions * 100) if impressions else 0, 4),
+        "link_ctr": metric_round(
+            (link_clicks / impressions * 100) if impressions else 0,
+            4,
+        ),
         "cpc": metric_round(spend / clicks, 4) if clicks else (None if spend > 0 else 0),
         "link_cpc": (
             metric_round(spend / link_clicks, 4)
@@ -1816,227 +1601,8 @@ def build_metrics(spend, impressions, reach, clicks, link_clicks, leads, lpv):
             if lpv
             else (None if spend > 0 else 0)
         ),
-        # Taxas do funil calculadas no backend para permitir diagnóstico por etapa.
-        "lpv_rate_from_link_clicks": safe_rate(lpv, link_clicks),
-        "lead_rate_from_lpv": safe_rate(leads, lpv),
-        "lead_rate_from_link_clicks": safe_rate(leads, link_clicks),
     }
 
-
-def share_percent(value, total):
-    total = safe_float(total)
-    if total <= 0:
-        return 0
-    return metric_round(safe_float(value) / total * 100, 2)
-
-
-def build_entity_analysis(rows, summary, level):
-    """
-    Converte uma lista extensa de métricas em sinais de decisão.
-    Não inventa causa: apenas mede concentração, eficiência e materialidade.
-    """
-    if level == "account":
-        return {
-            "funnel": {
-                "cpm": summary.get("cpm"),
-                "link_ctr": summary.get("link_ctr"),
-                "link_cpc": summary.get("link_cpc"),
-                "lpv_rate_from_link_clicks": summary.get("lpv_rate_from_link_clicks"),
-                "lead_rate_from_lpv": summary.get("lead_rate_from_lpv"),
-                "lead_rate_from_link_clicks": summary.get("lead_rate_from_link_clicks"),
-                "cpl": summary.get("cpl"),
-            }
-        }
-
-    total_spend = safe_float(summary.get("spend"))
-    total_leads = safe_float(summary.get("leads"))
-    benchmark_cpl = summary.get("cpl")
-    enriched = []
-
-    for row in rows:
-        spend = safe_float(row.get("spend"))
-        leads = safe_float(row.get("leads"))
-        cpl = row.get("cpl")
-        spend_share = share_percent(spend, total_spend)
-        lead_share = share_percent(leads, total_leads)
-        share_gap = metric_round(spend_share - lead_share, 2)
-
-        cpl_vs_account_pct = None
-        if cpl is not None and benchmark_cpl not in (None, 0):
-            cpl_vs_account_pct = metric_round(
-                (safe_float(cpl) / safe_float(benchmark_cpl) - 1) * 100,
-                2,
-            )
-
-        flags = []
-        if spend > 0 and leads <= 0:
-            flags.append("spend_without_leads")
-        if cpl_vs_account_pct is not None and cpl_vs_account_pct >= 25 and spend_share >= 5:
-            flags.append("material_cpl_above_account")
-        if cpl_vs_account_pct is not None and cpl_vs_account_pct <= -20 and lead_share >= 5:
-            flags.append("material_efficiency_above_account")
-        if share_gap >= 8:
-            flags.append("spend_share_above_lead_share")
-        if share_gap <= -8:
-            flags.append("lead_share_above_spend_share")
-
-        attention_score = (
-            max(share_gap, 0)
-            + (max(cpl_vs_account_pct or 0, 0) / 100.0) * spend_share
-            + (spend_share if leads <= 0 and spend > 0 else 0)
-        )
-        strength_score = (
-            max(-share_gap, 0)
-            + (max(-(cpl_vs_account_pct or 0), 0) / 100.0) * lead_share
-        )
-
-        enriched.append({
-            "id": entity_id_for_row(row, level),
-            "name": entity_name_for_row(row, level),
-            "spend": row.get("spend"),
-            "leads": row.get("leads"),
-            "cpl": row.get("cpl"),
-            "link_ctr": row.get("link_ctr"),
-            "link_cpc": row.get("link_cpc"),
-            "spend_share_pct": spend_share,
-            "lead_share_pct": lead_share,
-            "spend_minus_lead_share_pp": share_gap,
-            "cpl_vs_account_pct": cpl_vs_account_pct,
-            "flags": flags,
-            "attention_score": metric_round(attention_score, 4),
-            "strength_score": metric_round(strength_score, 4),
-        })
-
-    by_spend = sorted(enriched, key=lambda x: safe_float(x.get("spend")), reverse=True)
-    attention = sorted(enriched, key=lambda x: safe_float(x.get("attention_score")), reverse=True)
-    strengths = sorted(enriched, key=lambda x: safe_float(x.get("strength_score")), reverse=True)
-
-    return {
-        "benchmark": {
-            "account_cpl": benchmark_cpl,
-            "total_spend": summary.get("spend"),
-            "total_leads": summary.get("leads"),
-        },
-        "concentration": {
-            "top_3_spend_share_pct": metric_round(
-                sum(safe_float(item.get("spend_share_pct")) for item in by_spend[:3]),
-                2,
-            ),
-        },
-        "top_attention": attention[:5],
-        "top_strengths": [item for item in strengths[:5] if safe_float(item.get("strength_score")) > 0],
-        "spend_without_leads": [
-            item for item in by_spend
-            if "spend_without_leads" in item.get("flags", [])
-        ][:5],
-    }
-
-
-def funnel_change_signals(summary_a, summary_b):
-    checks = [
-        ("cpm", "auction_cost"),
-        ("link_ctr", "traffic_response"),
-        ("link_cpc", "click_cost"),
-        ("lpv_rate_from_link_clicks", "landing_arrival"),
-        ("lead_rate_from_lpv", "post_landing_conversion"),
-        ("lead_rate_from_link_clicks", "click_to_lead_conversion"),
-        ("cpl", "lead_cost"),
-    ]
-    signals = []
-    for metric, stage in checks:
-        old = summary_a.get(metric)
-        new = summary_b.get(metric)
-        if old in (None, 0) or new is None:
-            continue
-        delta = percent_change(old, new)
-        if delta is None:
-            continue
-        signals.append({
-            "stage": stage,
-            "metric": metric,
-            "period_a": old,
-            "period_b": new,
-            "change_pct": delta,
-        })
-    return signals
-
-
-def build_comparison_analysis(period_a_summary, period_b_summary, entities):
-    total_spend_b = safe_float(period_b_summary.get("spend"))
-    total_leads_b = safe_float(period_b_summary.get("leads"))
-    benchmark_cpl_b = period_b_summary.get("cpl")
-    drivers = []
-
-    for item in entities:
-        a = item.get("period_a", {})
-        b = item.get("period_b", {})
-        spend_b = safe_float(b.get("spend"))
-        leads_b = safe_float(b.get("leads"))
-        spend_share_b = share_percent(spend_b, total_spend_b)
-        lead_share_b = share_percent(leads_b, total_leads_b)
-        share_gap_b = metric_round(spend_share_b - lead_share_b, 2)
-        cpl_change = item.get("deltas", {}).get("cpl", {}).get("percent")
-        spend_change = item.get("deltas", {}).get("spend", {}).get("absolute")
-        leads_change = item.get("deltas", {}).get("leads", {}).get("absolute")
-        cpl_b = b.get("cpl")
-
-        cpl_vs_account_b = None
-        if cpl_b is not None and benchmark_cpl_b not in (None, 0):
-            cpl_vs_account_b = metric_round(
-                (safe_float(cpl_b) / safe_float(benchmark_cpl_b) - 1) * 100,
-                2,
-            )
-
-        negative_score = (
-            max(share_gap_b, 0)
-            + (max(safe_float(cpl_change), 0) / 100.0) * spend_share_b
-            + (spend_share_b if spend_b > 0 and leads_b <= 0 else 0)
-        )
-        positive_score = (
-            max(-share_gap_b, 0)
-            + (max(-safe_float(cpl_change), 0) / 100.0) * lead_share_b
-        )
-
-        drivers.append({
-            "id": item.get("id"),
-            "name": item.get("name"),
-            "current_spend": b.get("spend"),
-            "current_leads": b.get("leads"),
-            "current_cpl": b.get("cpl"),
-            "spend_change_absolute": spend_change,
-            "leads_change_absolute": leads_change,
-            "cpl_change_pct": cpl_change,
-            "current_spend_share_pct": spend_share_b,
-            "current_lead_share_pct": lead_share_b,
-            "spend_minus_lead_share_pp": share_gap_b,
-            "current_cpl_vs_account_pct": cpl_vs_account_b,
-            "negative_impact_score": metric_round(negative_score, 4),
-            "positive_impact_score": metric_round(positive_score, 4),
-        })
-
-    negative = sorted(drivers, key=lambda x: safe_float(x.get("negative_impact_score")), reverse=True)
-    positive = sorted(drivers, key=lambda x: safe_float(x.get("positive_impact_score")), reverse=True)
-
-    return {
-        "account_direction": {
-            "spend_change_pct": percent_change(period_a_summary.get("spend"), period_b_summary.get("spend")),
-            "leads_change_pct": percent_change(period_a_summary.get("leads"), period_b_summary.get("leads")),
-            "cpl_change_pct": percent_change(period_a_summary.get("cpl"), period_b_summary.get("cpl")),
-        },
-        "funnel_change_signals": funnel_change_signals(period_a_summary, period_b_summary),
-        "main_negative_drivers": [
-            item for item in negative[:5]
-            if safe_float(item.get("negative_impact_score")) > 0
-        ],
-        "main_positive_drivers": [
-            item for item in positive[:5]
-            if safe_float(item.get("positive_impact_score")) > 0
-        ],
-        "interpretation_note": (
-            "Os scores são heurísticas de priorização por materialidade e eficiência, "
-            "não prova causal. Use os dados brutos para sustentar a conclusão final."
-        ),
-    }
 
 def entity_fields_for_level(level):
     if level == "campaign":
@@ -2290,7 +1856,6 @@ def query_meta_insights(
         "returned_rows": len(returned_rows),
         "summary": full_summary,
         "rows": returned_rows,
-        "analysis": build_entity_analysis(returned_rows, full_summary, level),
     }
 
     print(
@@ -2540,11 +2105,6 @@ def compare_meta_periods(
         },
         "summary_deltas_a_to_b": summary_deltas,
         "entities": entities,
-        "analysis": build_comparison_analysis(
-            report_a["summary"],
-            report_b["summary"],
-            entities,
-        ),
         "note": (
             "Percentual nulo significa que o valor do período A era zero; "
             "não é possível calcular variação percentual convencional."
@@ -2722,105 +2282,36 @@ DYNAMIC_ANALYSIS_TOOLS = [
 def build_dynamic_instructions(context):
     today = get_today_for_context(context)
     return f"""
-Você é um analista sênior de performance em Meta Ads dentro de um produto SaaS.
-Sua função NÃO é recitar métricas. Sua função é transformar dados em diagnóstico e prioridade.
-
+Você é o analista sênior de Meta Ads de um produto SaaS conversacional.
 Empresa atual: {context.get('company_name')}.
 Conta Meta selecionada: {context.get('ad_account_id') or 'nenhuma'}.
 Data atual na timezone da conta: {today.isoformat()}.
 
-PRINCÍPIO CENTRAL
-- Número é evidência, não conclusão.
-- Antes de responder, identifique qual é o principal problema, oportunidade ou ausência de evidência.
-- Priorize impacto. Uma entidade com CPL ruim e pouco gasto pode ser menos importante do que uma entidade moderadamente ruim com grande participação no investimento.
-- Não despeje todas as métricas disponíveis. Selecione somente as que provam a leitura.
-
-PROTOCOLO ANALÍTICO
-1. Entenda o que o usuário quer decidir, não apenas quais números ele pediu.
-2. Use as ferramentas para buscar fatos reais.
-3. Para análises gerais ou perguntas como "o que está acontecendo?", "o que piorou?", "o que merece atenção?":
-   - compare períodos equivalentes quando houver referência temporal;
-   - comece pela conta e/ou campanha;
-   - use a seção analysis retornada pela ferramenta para priorizar materialidade;
-   - aprofunde em conjunto ou anúncio somente quando isso for necessário para sustentar o diagnóstico.
-4. Procure o estágio onde a mudança apareceu:
-   - CPM: pressão de custo de leilão/distribuição;
-   - link CTR: resposta ao anúncio/tráfego;
-   - link CPC: custo para gerar clique;
-   - LPV por clique: chegada efetiva à página;
-   - lead por LPV: conversão depois da chegada à página;
-   - CPL: resultado final da combinação das etapas.
-5. Uma mudança em uma métrica NÃO prova a causa. Use "sinal", "indício" ou "hipótese" quando não houver prova causal.
-6. Diferencie sempre:
-   - FATO: sustentado diretamente pelos dados;
-   - LEITURA: interpretação do conjunto dos fatos;
-   - HIPÓTESE: explicação ainda não comprovada;
-   - AÇÃO: próximo passo recomendado para confirmar ou corrigir.
-
-REGRAS DE DADOS
+REGRAS ABSOLUTAS:
+- Responda em português do Brasil, de forma prática, direta e analítica.
 - Para qualquer afirmação quantitativa sobre a conta, use as ferramentas.
-- CPL, CTR, CPC, CPM, taxas de funil e variações são calculados pelo backend.
-- Nunca invente números, campanhas, conjuntos, anúncios ou causas.
-- Se não houver dados suficientes, diga isso claramente.
 - Se o usuário não informar período e o contexto anterior não estabelecer um, use o mês atual até hoje.
-- Para "este mês x mês passado" com mês atual incompleto, use comparar_periodos com mode=current_month_vs_previous_equivalent.
-- Para meses completos ou datas específicas, use mode=custom.
-- Para "últimos N dias x N anteriores", use períodos de mesmo tamanho.
-- Em follow-ups, mantenha o contexto da entidade e do período já analisados.
-- Estas ferramentas são somente leitura. Não crie ou altere campanhas.
+- Nunca invente números, campanhas, conjuntos, anúncios ou causas.
+- A ferramenta traz fatos; causas que não estejam provadas devem ser chamadas de hipótese.
+- CPL, CTR, CPC, CPM e demais métricas derivadas são calculadas pelo backend.
+- Quando o usuário disser 'este mês x mês passado' e o mês atual estiver incompleto,
+  use comparar_periodos com mode=current_month_vs_previous_equivalent.
+- Se o usuário pedir meses completos ou datas específicas, use mode=custom e respeite as datas.
+- Para 'últimos N dias', quando houver comparação, use períodos de mesmo tamanho.
+- Se precisar aprofundar uma campanha/conjunto/anúncio citado anteriormente, mantenha o contexto
+  e consulte o nível inferior apropriado, filtrando pelo nome ou ID conhecido.
+- Não execute criação ou alteração de campanhas por estas ferramentas; elas são somente leitura.
+- Se a pergunta não for sobre Meta Ads, explique brevemente o escopo e ofereça exemplos do que pode analisar.
+- Se não houver dados, diga explicitamente que a Meta não retornou dados para aquele recorte.
 
-COMO PRIORIZAR
-- Dê mais peso a entidades com participação material no investimento ou nos leads.
-- Procure desalinhamento entre participação no gasto e participação nos leads.
-- Campanhas com gasto relevante e zero leads merecem atenção imediata.
-- Compare CPL da entidade com o CPL da conta, mas não use esse benchmark isoladamente.
-- Em comparação temporal, observe simultaneamente investimento, leads, CPL e sinais do funil.
-- Quando houver vários problemas, escolha o que provavelmente tem maior impacto financeiro/operacional primeiro.
-
-CONTRATO DA RESPOSTA
-- Comece pela conclusão principal, não por uma lista de números.
-- Em uma análise normal, use no máximo 3 ou 4 números realmente necessários para provar a conclusão.
-- Não liste mais de 3 campanhas/conjuntos/anúncios, a menos que o usuário peça ranking ou lista.
-- Não repita os mesmos números em seções diferentes.
-- Não transforme toda resposta em relatório.
-- Se a pergunta for simples, responda em poucas linhas.
-- Se a pergunta for estratégica, a resposta preferida é:
-
-🧠 DIAGNÓSTICO
-Uma conclusão clara sobre o principal ponto.
-
-📌 EVIDÊNCIAS
-Somente os 2 a 4 dados que sustentam a conclusão.
-
-🔎 LEITURA
-Explique o que esses dados significam em conjunto. Separe hipótese de fato quando necessário.
-
-🎯 PRÓXIMA AÇÃO
-Uma ação concreta e priorizada. Se necessário, diga qual recorte deve ser investigado em seguida.
-
-FORMATAÇÃO PARA WHATSAPP
-- NÃO use Markdown: nenhum #, ##, ###, *, **, _, __, crases ou tabelas.
-- Títulos em MAIÚSCULAS, com no máximo um emoji no início.
-- Parágrafos curtos e linguagem natural.
-- O backend fará sanitização final.
-
-EXEMPLO DE QUALIDADE
-Pergunta: "Por que meu CPL piorou?"
-Resposta boa:
-🧠 DIAGNÓSTICO
-A piora está concentrada em poucas campanhas, não na conta inteira. A prioridade é corrigir onde o aumento de gasto não foi acompanhado por geração proporcional de leads.
-
-📌 EVIDÊNCIAS
-A campanha X concentra 38% do investimento atual, mas 17% dos leads.
-O CPL dela está 52% acima do CPL médio da conta.
-
-🔎 LEITURA
-Isso mostra um problema material de eficiência nessa campanha. Se o link CTR também caiu, há um sinal de perda antes do clique; se a taxa de lead por LPV caiu, o problema aparece depois da chegada à página. Não afirme uma causa sem consultar esses sinais.
-
-🎯 PRÓXIMA AÇÃO
-Aprofundar primeiro nos conjuntos e anúncios da campanha X para localizar em qual etapa a eficiência se perdeu.
-
-Resposta ruim: despejar investimento, impressões, alcance, cliques, CTR, CPC, CPM, leads e CPL de todas as campanhas sem dizer qual problema importa mais.
+FORMATO:
+Adapte o formato à pergunta. Em análises, prefira:
+📊 Resumo
+✅ O que melhorou
+⚠️ O que piorou / atenção
+🔎 Onde está o impacto
+🎯 Próxima ação
+Não force todas as seções quando uma resposta curta for suficiente.
 """
 
 
@@ -2834,7 +2325,7 @@ def execute_dynamic_tool(context, tool_name, arguments):
             until=arguments["until"],
             level=arguments.get("level", "account"),
             search=arguments.get("search"),
-            limit=arguments.get("limit", 12),
+            limit=arguments.get("limit", 25),
             sort_by=arguments.get("sort_by", "spend"),
             sort_order=arguments.get("sort_order", "desc"),
             min_spend=arguments.get("min_spend", 0),
@@ -2854,7 +2345,7 @@ def execute_dynamic_tool(context, tool_name, arguments):
             period_a_label=arguments.get("period_a_label"),
             period_b_label=arguments.get("period_b_label"),
             search=arguments.get("search"),
-            limit=arguments.get("limit", 12),
+            limit=arguments.get("limit", 25),
             sort_by=arguments.get("sort_by", "spend"),
         )
 
@@ -2871,9 +2362,9 @@ def execute_dynamic_tool(context, tool_name, arguments):
 
 def create_dynamic_openai_response(context, user_question, previous_response_id=None):
     kwargs = {
-        "model": OPENAI_ANALYSIS_MODEL,
-        "reasoning": {"effort": OPENAI_ANALYSIS_REASONING_EFFORT},
-        "max_output_tokens": 1200,
+        "model": OPENAI_MODEL,
+        "reasoning": {"effort": "low"},
+        "max_output_tokens": 1400,
         "instructions": build_dynamic_instructions(context),
         "tools": DYNAMIC_ANALYSIS_TOOLS,
         "tool_choice": "auto",
@@ -2894,8 +2385,7 @@ def run_dynamic_openai_analysis(context, user_question):
     print(
         "[DYNAMIC] OPENAI_FIRST_CALL",
         {
-            "model": OPENAI_ANALYSIS_MODEL,
-            "reasoning_effort": OPENAI_ANALYSIS_REASONING_EFFORT,
+            "model": OPENAI_MODEL,
             "has_previous_response": bool(previous_response_id),
         },
     )
@@ -2929,7 +2419,7 @@ def run_dynamic_openai_analysis(context, user_question):
         },
     )
 
-    max_tool_rounds = 8
+    max_tool_rounds = 6
     for round_number in range(1, max_tool_rounds + 1):
         tool_calls = [
             item for item in response.output
@@ -2941,7 +2431,6 @@ def run_dynamic_openai_analysis(context, user_question):
             if not final_text:
                 raise RuntimeError("OpenAI não retornou texto final.")
             save_ai_conversation_state(context, response.id)
-            final_text = clean_ai_text_for_whatsapp(final_text)
             return final_text, response.id
 
         print(
@@ -2994,9 +2483,9 @@ def run_dynamic_openai_analysis(context, user_question):
         )
 
         response = openai_client.responses.create(
-            model=OPENAI_ANALYSIS_MODEL,
-            reasoning={"effort": OPENAI_ANALYSIS_REASONING_EFFORT},
-            max_output_tokens=1200,
+            model=OPENAI_MODEL,
+            reasoning={"effort": "low"},
+            max_output_tokens=1400,
             instructions=build_dynamic_instructions(context),
             tools=DYNAMIC_ANALYSIS_TOOLS,
             tool_choice="auto",
@@ -3091,16 +2580,7 @@ def process_dynamic_analysis(sender, user_id, original_text):
             },
         )
 
-        formatted_answer = clean_ai_text_for_whatsapp(answer)
-        print(
-            "[DYNAMIC] FORMAT_CHECK",
-            {
-                "contains_hash": "#" in formatted_answer,
-                "contains_asterisk": "*" in formatted_answer,
-                "chars": len(formatted_answer),
-            },
-        )
-        send_whatsapp_long_message(sender, formatted_answer)
+        send_whatsapp_long_message(sender, answer)
         print("[DYNAMIC] JOB_DONE")
 
     except Exception as error:
@@ -3170,14 +2650,7 @@ Nunca invente números, campanhas, anúncios, conjuntos ou causas.
 Diferencie fatos de hipóteses.
 Responda em português do Brasil.
 
-FORMATO PARA WHATSAPP:
-- Use TEXTO PURO, sem Markdown.
-- Não use #, *, _, `, >, |, tabelas ou cercas de código.
-- Destaque blocos apenas com emoji + título curto em MAIÚSCULAS.
-- Use • somente quando realmente houver uma lista.
-- Mantenha a resposta limpa, compacta e fácil de escanear.
-
-Quando fizer sentido, organize em:
+Estruture em:
 📊 RESUMO
 ✅ PONTOS POSITIVOS
 ⚠️ PONTOS DE ATENÇÃO
@@ -3192,12 +2665,12 @@ DADOS:
 """,
     )
 
-    return clean_ai_text_for_whatsapp(response.output_text)
+    return response.output_text
 
 
 def build_basic_report(report):
     text = (
-        "📊 META ADS — ÚLTIMOS 7 DIAS\n\n"
+        "📊 *META ADS — ÚLTIMOS 7 DIAS*\n\n"
         f"💰 Investimento: {format_brl(report['spend'])}\n"
         f"👁 Impressões: {format_number(report['impressions'])}\n"
         f"🖱 Cliques: {format_number(report['clicks'])}\n"
@@ -3558,7 +3031,7 @@ def receive_webhook():
         # RELATÓRIO / IA
         # =================================================
 
-        if received_text == "gasto legado 7 dias":
+        if "gasto" in received_text and "7" in received_text:
             if not context["can_read_ads"]:
                 send_whatsapp_message(sender, "⛔ Você não possui permissão de leitura.")
                 return "EVENT_RECEIVED", 200
@@ -3587,7 +3060,7 @@ def receive_webhook():
             send_whatsapp_message(sender, build_basic_report(report))
             return "EVENT_RECEIVED", 200
 
-        if received_text == "analise legado 7 dias":
+        if "analise" in received_text and "7" in received_text:
             if not context["can_read_ads"]:
                 send_whatsapp_message(sender, "⛔ Você não possui permissão de leitura.")
                 return "EVENT_RECEIVED", 200
@@ -3632,15 +3105,16 @@ def receive_webhook():
                 f"Empresa: *{context['company_name']}*\n\n"
                 "Você pode perguntar em linguagem natural, por exemplo:\n\n"
                 "• Compare este mês com o mês passado\n"
-                "• Analise minha conta respeitando o setup real de cada campanha\n"
-                "• Identifique na Meta o objetivo desta campanha e analise o resultado correto\n"
-                "• Quais campanhas realmente merecem atenção considerando o próprio setup?\n"
+                "• Quais campanhas mais prejudicaram meu CPL?\n"
+                "• Quais anúncios gastaram mais de R$ 500 sem gerar leads?\n"
                 "• Compare os últimos 15 dias com os 15 anteriores\n"
                 "• Agora aprofunde na campanha que você acabou de citar\n\n"
                 "Comandos administrativos/técnicos:\n\n"
                 "🔗 conectar meta\n"
                 "📂 minhas contas meta\n"
                 "👤 quem sou eu\n"
+                "📊 gasto últimos 7 dias\n"
+                "🤖 analise meus últimos 7 dias\n"
                 "🔧 criar campanha teste"
             )
 
@@ -3698,1243 +3172,6 @@ def receive_webhook():
 
     return "EVENT_RECEIVED", 200
 
-
-
-# =========================================================
-# V9.1 — MOTOR META-DRIVEN / SEM TABELA FIXA DE OBJETIVOS
-# =========================================================
-#
-# Princípio central:
-# - a Meta é a fonte da verdade sobre o setup;
-# - o backend busca objective, optimization_goal e demais campos reais;
-# - o backend NÃO mantém uma tabela dizendo "objective X => KPI Y";
-# - a OpenAI interpreta o setup retornado pela própria Meta;
-# - quando a IA escolhe um action_type como resultado relevante, o backend
-#   valida se esse action_type realmente existe nos Insights antes de usá-lo.
-#
-# Isso evita tratar "Resultados" como sinônimo de lead e evita engessar o
-# produto quando a Meta cria/renomeia objetivos, performance goals ou eventos.
-
-V91_BASE_SORT_METRICS = {
-    "spend",
-    "impressions",
-    "reach",
-    "frequency",
-    "clicks",
-    "link_clicks",
-    "ctr",
-    "link_ctr",
-    "cpc",
-    "link_cpc",
-    "cpm",
-    "landing_page_views",
-    "cost_per_landing_page_view",
-    "selected_action_value",
-    "selected_action_cost",
-}
-
-
-def v91_json_safe(value):
-    """Converte objetos aninhados em estruturas JSON simples sem inventar semântica."""
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, dict):
-        return {str(k): v91_json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [v91_json_safe(v) for v in value]
-    return str(value)
-
-
-def v91_action_catalog(items):
-    """
-    Converte AdsActionStats em mapa action_type -> value.
-    Não seleciona qual action_type é "resultado"; apenas preserva o que a Meta retornou.
-    """
-    catalog = {}
-    raw = []
-    for item in items or []:
-        if not isinstance(item, dict):
-            continue
-        clean = v91_json_safe(item)
-        raw.append(clean)
-        action_type = item.get("action_type")
-        if not action_type:
-            continue
-        value = item.get("value")
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            numeric = value
-        catalog[str(action_type)] = numeric
-    return catalog, raw[:120]
-
-
-def v91_sum_action_catalogs(rows, field_name):
-    total = {}
-    for row in rows:
-        catalog = row.get(field_name) or {}
-        for key, value in catalog.items():
-            if isinstance(value, (int, float)):
-                total[key] = total.get(key, 0.0) + float(value)
-    return {key: metric_round(value, 4) for key, value in total.items()}
-
-
-def v91_meta_get_edge_with_fallback(url, access_token, field_variants, limit=500, max_pages=20):
-    """Tenta conjuntos de campos do mais rico ao mais conservador."""
-    proof = appsecret_proof(access_token)
-    last_error = None
-
-    for fields in field_variants:
-        params = {
-            "access_token": access_token,
-            "fields": ",".join(fields),
-            "limit": limit,
-        }
-        if proof:
-            params["appsecret_proof"] = proof
-        try:
-            rows = meta_get_paginated(url, params, max_pages=max_pages)
-            print("[V9.1] META_SETUP_FIELDS_OK", fields)
-            return rows, fields
-        except RuntimeError as error:
-            last_error = error
-            print("[V9.1] META_SETUP_FIELDS_FALLBACK", fields, repr(error))
-
-    if last_error:
-        raise last_error
-    return [], []
-
-
-def v91_fetch_setup_metadata(ad_account_id, access_token):
-    """Busca da própria Meta o setup real de campanhas e conjuntos."""
-    campaigns_url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{ad_account_id}/campaigns"
-    adsets_url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{ad_account_id}/adsets"
-
-    campaign_variants = [
-        [
-            "id", "name", "objective", "status", "effective_status", "buying_type",
-            "bid_strategy", "promoted_object", "smart_promotion_type",
-            "special_ad_categories",
-        ],
-        ["id", "name", "objective", "status", "effective_status", "buying_type", "bid_strategy"],
-        ["id", "name", "objective", "status", "effective_status", "buying_type"],
-    ]
-    adset_variants = [
-        [
-            "id", "name", "campaign_id", "optimization_goal", "optimization_sub_event",
-            "billing_event", "bid_strategy", "promoted_object", "destination_type",
-            "attribution_spec", "status", "effective_status",
-        ],
-        [
-            "id", "name", "campaign_id", "optimization_goal", "billing_event",
-            "bid_strategy", "promoted_object", "status", "effective_status",
-        ],
-        [
-            "id", "name", "campaign_id", "optimization_goal", "billing_event",
-            "status", "effective_status",
-        ],
-    ]
-
-    campaigns, campaign_fields_used = v91_meta_get_edge_with_fallback(
-        campaigns_url, access_token, campaign_variants
-    )
-    adsets, adset_fields_used = v91_meta_get_edge_with_fallback(
-        adsets_url, access_token, adset_variants
-    )
-
-    campaigns_by_id = {
-        str(row.get("id")): v91_json_safe(row)
-        for row in campaigns
-        if row.get("id")
-    }
-    adsets_by_id = {
-        str(row.get("id")): v91_json_safe(row)
-        for row in adsets
-        if row.get("id")
-    }
-    adsets_by_campaign = {}
-    for adset in adsets:
-        campaign_id = str(adset.get("campaign_id") or "")
-        if campaign_id:
-            adsets_by_campaign.setdefault(campaign_id, []).append(v91_json_safe(adset))
-
-    return {
-        "campaigns": campaigns_by_id,
-        "adsets": adsets_by_id,
-        "adsets_by_campaign": adsets_by_campaign,
-        "fields_used": {
-            "campaign": campaign_fields_used,
-            "adset": adset_fields_used,
-        },
-    }
-
-
-def v91_compact_promoted_object(value):
-    """Mantém o promoted_object vindo da Meta, removendo apenas valores vazios."""
-    if not isinstance(value, dict):
-        return v91_json_safe(value)
-    return {
-        str(k): v91_json_safe(v)
-        for k, v in value.items()
-        if v not in (None, "", [], {})
-    }
-
-
-def v91_adset_setup_view(adset):
-    if not adset:
-        return None
-    return {
-        "id": adset.get("id"),
-        "name": adset.get("name"),
-        "optimization_goal": adset.get("optimization_goal"),
-        "optimization_sub_event": adset.get("optimization_sub_event"),
-        "billing_event": adset.get("billing_event"),
-        "destination_type": adset.get("destination_type"),
-        "bid_strategy": adset.get("bid_strategy"),
-        "promoted_object": v91_compact_promoted_object(adset.get("promoted_object")),
-        "attribution_spec": v91_json_safe(adset.get("attribution_spec")),
-        "status": adset.get("status"),
-        "effective_status": adset.get("effective_status"),
-    }
-
-
-def v91_campaign_setup_view(campaign):
-    if not campaign:
-        return None
-    return {
-        "id": campaign.get("id"),
-        "name": campaign.get("name"),
-        "objective": campaign.get("objective"),
-        "buying_type": campaign.get("buying_type"),
-        "bid_strategy": campaign.get("bid_strategy"),
-        "promoted_object": v91_compact_promoted_object(campaign.get("promoted_object")),
-        "smart_promotion_type": campaign.get("smart_promotion_type"),
-        "special_ad_categories": v91_json_safe(campaign.get("special_ad_categories")),
-        "status": campaign.get("status"),
-        "effective_status": campaign.get("effective_status"),
-    }
-
-
-def v91_setup_signature(campaign, adset=None):
-    """
-    Assinatura apenas para saber se dois setups são iguais.
-    Ela NÃO traduz o setup para um KPI.
-    """
-    payload = {
-        "campaign_objective": (campaign or {}).get("objective"),
-        "campaign_promoted_object": v91_compact_promoted_object((campaign or {}).get("promoted_object")),
-        "optimization_goal": (adset or {}).get("optimization_goal"),
-        "optimization_sub_event": (adset or {}).get("optimization_sub_event"),
-        "billing_event": (adset or {}).get("billing_event"),
-        "destination_type": (adset or {}).get("destination_type"),
-        "adset_promoted_object": v91_compact_promoted_object((adset or {}).get("promoted_object")),
-    }
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
-
-
-def v91_setup_for_insight(raw, level, metadata):
-    campaign_id = str(raw.get("campaign_id") or "")
-    adset_id = str(raw.get("adset_id") or "")
-    campaign = metadata.get("campaigns", {}).get(campaign_id, {})
-    adset = metadata.get("adsets", {}).get(adset_id, {}) if adset_id else {}
-
-    result = {
-        "campaign": v91_campaign_setup_view(campaign),
-        "adset": v91_adset_setup_view(adset) if adset else None,
-        "setup_signature": v91_setup_signature(campaign, adset if adset else None),
-        "source": "meta_marketing_api",
-    }
-
-    if level == "campaign" and campaign_id:
-        adsets = metadata.get("adsets_by_campaign", {}).get(campaign_id, [])
-        variants = []
-        seen = set()
-        for child in adsets:
-            signature = v91_setup_signature(campaign, child)
-            if signature in seen:
-                continue
-            seen.add(signature)
-            variants.append({
-                "setup_signature": signature,
-                "adset_setup": v91_adset_setup_view(child),
-            })
-        result["adset_setup_variants"] = variants[:30]
-        result["setup_variant_count"] = len(variants)
-        result["requires_adset_drilldown"] = len(variants) > 1
-
-    return result
-
-
-def v91_base_metrics(raw):
-    """Métricas universais. Nenhuma delas é declarada automaticamente como KPI principal."""
-    spend = safe_float(raw.get("spend"))
-    impressions = safe_int(raw.get("impressions"))
-    reach = safe_int(raw.get("reach"))
-    clicks = safe_int(raw.get("clicks"))
-    link_clicks = safe_int(raw.get("inline_link_clicks"))
-    lpv = get_landing_page_views(raw.get("actions", []))
-
-    return {
-        "spend": metric_round(spend, 2),
-        "impressions": impressions,
-        "reach": reach,
-        "frequency": metric_round(impressions / reach if reach else 0, 4),
-        "clicks": clicks,
-        "link_clicks": link_clicks,
-        "ctr": safe_rate(clicks, impressions),
-        "link_ctr": safe_rate(link_clicks, impressions),
-        "cpc": metric_round(spend / clicks, 4) if clicks else (None if spend > 0 else 0),
-        "link_cpc": metric_round(spend / link_clicks, 4) if link_clicks else (None if spend > 0 else 0),
-        "cpm": metric_round(spend / impressions * 1000, 4) if impressions else (None if spend > 0 else 0),
-        "landing_page_views": metric_round(lpv, 2),
-        "cost_per_landing_page_view": metric_round(spend / lpv, 4) if lpv else (None if spend > 0 else 0),
-    }
-
-
-def v91_insight_field_variants(level):
-    entity_fields = entity_fields_for_level(level)
-    common = [
-        "account_id", "account_name", "date_start", "date_stop",
-        "spend", "impressions", "reach", "clicks", "inline_link_clicks",
-    ]
-    for field in entity_fields:
-        if field not in common:
-            common.append(field)
-
-    # Estes campos são da própria camada de Insights da Meta. A v9.1 tenta primeiro
-    # obter inclusive os resultados contextualizados pela plataforma; se uma conta/
-    # versão não expuser algum deles, há fallback progressivo.
-    rich = common + [
-        "objective", "optimization_goal",
-        "objective_results", "objective_result_rate",
-        "cost_per_objective_result", "cost_per_result",
-        "actions", "cost_per_action_type", "action_values",
-        "outbound_clicks", "cost_per_outbound_click",
-        "purchase_roas", "website_purchase_roas", "mobile_app_purchase_roas",
-        "video_thruplay_watched_actions", "video_2_sec_continuous_watched_actions",
-    ]
-    standard = common + [
-        "objective", "optimization_goal",
-        "objective_results", "cost_per_objective_result", "cost_per_result",
-        "actions", "cost_per_action_type", "action_values",
-    ]
-    actions_only = common + ["objective", "optimization_goal", "actions", "cost_per_action_type", "action_values"]
-    minimal = common + ["actions"]
-    return [rich, standard, actions_only, minimal]
-
-
-def v91_fetch_raw_insights(ad_account_id, access_token, since, until, level):
-    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{ad_account_id}/insights"
-    proof = appsecret_proof(access_token)
-    last_error = None
-
-    for fields in v91_insight_field_variants(level):
-        params = {
-            "access_token": access_token,
-            "fields": ",".join(fields),
-            "time_range": json.dumps({"since": since, "until": until}),
-            "level": level,
-            "limit": 500,
-        }
-        if proof:
-            params["appsecret_proof"] = proof
-        try:
-            rows = meta_get_paginated(url, params, max_pages=20)
-            print("[V9.1] INSIGHT_FIELDS_OK", fields)
-            return rows, fields
-        except RuntimeError as error:
-            last_error = error
-            print("[V9.1] INSIGHT_FIELDS_FALLBACK", fields, repr(error))
-
-    if last_error:
-        raise last_error
-    return [], []
-
-
-def v91_extract_list_scalar(value):
-    """Preserva listas/objetos da Meta; usado só para deixar o payload serializável."""
-    return v91_json_safe(value)
-
-
-def v91_normalize_insight_row(raw, level, metadata, selected_action_type=None):
-    row = {
-        "date_start": raw.get("date_start"),
-        "date_stop": raw.get("date_stop"),
-    }
-    for field in entity_fields_for_level(level):
-        row[field] = raw.get(field)
-    row.update(v91_base_metrics(raw))
-
-    actions, actions_raw = v91_action_catalog(raw.get("actions"))
-    action_costs, action_costs_raw = v91_action_catalog(raw.get("cost_per_action_type"))
-    action_values, action_values_raw = v91_action_catalog(raw.get("action_values"))
-
-    row["meta_setup"] = v91_setup_for_insight(raw, level, metadata) if level != "account" else {
-        "source": "meta_marketing_api",
-        "note": "Conta não possui um único objective/optimization_goal. Use setup_portfolio por conjunto/campanha.",
-    }
-    row["meta_reported_result"] = {
-        "insights_objective": raw.get("objective"),
-        "insights_optimization_goal": raw.get("optimization_goal"),
-        "objective_results": v91_extract_list_scalar(raw.get("objective_results")),
-        "objective_result_rate": v91_extract_list_scalar(raw.get("objective_result_rate")),
-        "cost_per_objective_result": v91_extract_list_scalar(raw.get("cost_per_objective_result")),
-        "cost_per_result": v91_extract_list_scalar(raw.get("cost_per_result")),
-        "note": (
-            "Campos retornados diretamente pelos Insights da Meta. Se estiverem preenchidos, "
-            "eles têm precedência sobre qualquer inferência manual de 'Resultados'."
-        ),
-    }
-    row["available_actions"] = actions
-    row["available_cost_per_action"] = action_costs
-    row["available_action_values"] = action_values
-    row["raw_action_stats"] = {
-        "actions": actions_raw,
-        "cost_per_action_type": action_costs_raw,
-        "action_values": action_values_raw,
-    }
-
-    # Mantém outros campos ricos sem transformá-los em KPI automaticamente.
-    row["additional_meta_metrics"] = {
-        "outbound_clicks": v91_json_safe(raw.get("outbound_clicks")),
-        "cost_per_outbound_click": v91_json_safe(raw.get("cost_per_outbound_click")),
-        "purchase_roas": v91_json_safe(raw.get("purchase_roas")),
-        "website_purchase_roas": v91_json_safe(raw.get("website_purchase_roas")),
-        "mobile_app_purchase_roas": v91_json_safe(raw.get("mobile_app_purchase_roas")),
-        "video_thruplay_watched_actions": v91_json_safe(raw.get("video_thruplay_watched_actions")),
-        "video_2_sec_continuous_watched_actions": v91_json_safe(raw.get("video_2_sec_continuous_watched_actions")),
-    }
-
-    if selected_action_type:
-        value = actions.get(selected_action_type)
-        meta_cost = action_costs.get(selected_action_type)
-        derived_cost = None
-        if isinstance(value, (int, float)) and float(value) > 0:
-            derived_cost = metric_round(safe_float(row.get("spend")) / float(value), 4)
-        row["selected_action_type"] = selected_action_type
-        row["selected_action_found"] = selected_action_type in actions
-        row["selected_action_value"] = value
-        row["selected_action_cost"] = meta_cost if meta_cost is not None else derived_cost
-        row["selected_action_cost_source"] = (
-            "meta_cost_per_action_type"
-            if meta_cost is not None
-            else ("derived_spend_divided_by_action" if derived_cost is not None else None)
-        )
-
-    return row
-
-
-def v91_aggregate_base(rows):
-    spend = sum(safe_float(row.get("spend")) for row in rows)
-    impressions = sum(safe_int(row.get("impressions")) for row in rows)
-    clicks = sum(safe_int(row.get("clicks")) for row in rows)
-    link_clicks = sum(safe_int(row.get("link_clicks")) for row in rows)
-    lpv = sum(safe_float(row.get("landing_page_views")) for row in rows)
-
-    # Reach somado entre entidades pode duplicar pessoas. Por isso fica explicitamente rotulado.
-    reach_sum = sum(safe_int(row.get("reach")) for row in rows)
-    return {
-        "spend": metric_round(spend, 2),
-        "impressions": impressions,
-        "reach_sum_not_deduplicated": reach_sum,
-        "clicks": clicks,
-        "link_clicks": link_clicks,
-        "ctr": safe_rate(clicks, impressions),
-        "link_ctr": safe_rate(link_clicks, impressions),
-        "cpc": metric_round(spend / clicks, 4) if clicks else (None if spend > 0 else 0),
-        "link_cpc": metric_round(spend / link_clicks, 4) if link_clicks else (None if spend > 0 else 0),
-        "cpm": metric_round(spend / impressions * 1000, 4) if impressions else (None if spend > 0 else 0),
-        "landing_page_views": metric_round(lpv, 2),
-        "cost_per_landing_page_view": metric_round(spend / lpv, 4) if lpv else (None if spend > 0 else 0),
-    }
-
-
-def v91_build_setup_portfolio(rows):
-    """Agrupa apenas setups iguais; não decide qual KPI cada grupo deve usar."""
-    groups = {}
-    total_spend = sum(safe_float(row.get("spend")) for row in rows)
-
-    for row in rows:
-        setup = row.get("meta_setup") or {}
-        signature = setup.get("setup_signature") or "account_or_unknown"
-        groups.setdefault(signature, []).append(row)
-
-    output = []
-    for signature, group_rows in groups.items():
-        first = group_rows[0]
-        setup = first.get("meta_setup") or {}
-        spend = sum(safe_float(row.get("spend")) for row in group_rows)
-        campaigns = {
-            row.get("campaign_id")
-            for row in group_rows
-            if row.get("campaign_id")
-        }
-        adsets = {
-            row.get("adset_id")
-            for row in group_rows
-            if row.get("adset_id")
-        }
-        output.append({
-            "setup_signature": signature,
-            "campaign_setup": setup.get("campaign"),
-            "adset_setup": setup.get("adset"),
-            "spend": metric_round(spend, 2),
-            "spend_share_pct": share_percent(spend, total_spend),
-            "campaign_count": len(campaigns),
-            "adset_count": len(adsets),
-            "available_action_types": sorted({
-                action_type
-                for row in group_rows
-                for action_type in (row.get("available_actions") or {}).keys()
-            })[:120],
-            "meta_result_examples": [
-                row.get("meta_reported_result")
-                for row in group_rows[:3]
-                if row.get("meta_reported_result")
-            ],
-        })
-
-    output.sort(key=lambda item: safe_float(item.get("spend")), reverse=True)
-    return {
-        "group_count": len(output),
-        "total_spend": metric_round(total_spend, 2),
-        "groups": output,
-        "rule": (
-            "Grupos refletem configurações retornadas pela Meta. O backend não atribui "
-            "um KPI fixo a nenhum grupo; a interpretação é feita pela IA a partir do setup real."
-        ),
-    }
-
-
-def v91_sort_rows(rows, sort_by, sort_order):
-    reverse = (sort_order or "desc").lower() == "desc"
-
-    def key(row):
-        value = row.get(sort_by)
-        if value is None:
-            return float("-inf") if reverse else float("inf")
-        return safe_float(value)
-
-    rows.sort(key=key, reverse=reverse)
-    return rows
-
-
-def query_meta_insights(
-    context,
-    since,
-    until,
-    level="account",
-    search=None,
-    limit=25,
-    sort_by="spend",
-    sort_order="desc",
-    min_spend=0,
-    include_zero_spend=True,
-    action_type=None,
-):
-    print("[V9.1] QUERY_META_DRIVEN_START", {
-        "since": since,
-        "until": until,
-        "level": level,
-        "search": search,
-        "sort_by": sort_by,
-        "action_type": action_type,
-    })
-
-    if level not in ALLOWED_LEVELS:
-        raise ValueError(f"Nível inválido: {level}")
-    if sort_by not in V91_BASE_SORT_METRICS:
-        raise ValueError(f"Métrica de ordenação inválida na v9.1: {sort_by}")
-    if sort_by in {"selected_action_value", "selected_action_cost"} and not action_type:
-        raise ValueError("Para ordenar por resultado dinâmico, informe action_type após inspecionar o setup da Meta.")
-    if (sort_order or "desc").lower() not in {"asc", "desc"}:
-        raise ValueError("sort_order deve ser asc ou desc.")
-
-    limit = max(1, min(int(limit or 25), 100))
-    min_spend = max(0.0, safe_float(min_spend))
-    today = get_today_for_context(context)
-    validate_date_range(since, until, today=today)
-
-    ad_account_id, access_token, credential_error = get_meta_credentials(context)
-    if credential_error:
-        raise RuntimeError(credential_error)
-
-    metadata = v91_fetch_setup_metadata(ad_account_id, access_token)
-    raw_rows, insight_fields_used = v91_fetch_raw_insights(
-        ad_account_id, access_token, since, until, level
-    )
-    rows = [
-        v91_normalize_insight_row(row, level, metadata, selected_action_type=action_type)
-        for row in raw_rows
-    ]
-
-    if search:
-        needle = normalize_text(str(search))
-        rows = [
-            row for row in rows
-            if needle in normalize_text(" ".join(
-                str(row.get(field) or "") for field in entity_fields_for_level(level)
-            ))
-        ]
-
-    rows = [row for row in rows if safe_float(row.get("spend")) >= min_spend]
-    if not include_zero_spend:
-        rows = [row for row in rows if safe_float(row.get("spend")) > 0]
-
-    # Para conta, buscamos adsets em paralelo para mostrar a composição real do setup.
-    # Isso evita fingir que a conta inteira possui um único objetivo.
-    setup_entities = []
-    if level == "account":
-        adset_raw, _ = v91_fetch_raw_insights(
-            ad_account_id, access_token, since, until, "adset"
-        )
-        setup_entities = [
-            v91_normalize_insight_row(
-                row, "adset", metadata, selected_action_type=action_type
-            )
-            for row in adset_raw
-        ]
-        setup_entities = [
-            row for row in setup_entities
-            if safe_float(row.get("spend")) >= min_spend
-            and (include_zero_spend or safe_float(row.get("spend")) > 0)
-        ]
-        setup_entities.sort(key=lambda item: safe_float(item.get("spend")), reverse=True)
-
-    v91_sort_rows(rows, sort_by, sort_order)
-    returned_rows = rows[:limit]
-
-    if level == "account" and returned_rows:
-        # O row de conta vem deduplicado pela Meta e é a melhor fonte para métricas globais.
-        summary = {
-            key: returned_rows[0].get(key)
-            for key in [
-                "spend", "impressions", "reach", "frequency", "clicks", "link_clicks",
-                "ctr", "link_ctr", "cpc", "link_cpc", "cpm", "landing_page_views",
-                "cost_per_landing_page_view",
-            ]
-        }
-        summary["meta_reported_result"] = returned_rows[0].get("meta_reported_result")
-        summary["available_actions"] = returned_rows[0].get("available_actions")
-        summary["available_cost_per_action"] = returned_rows[0].get("available_cost_per_action")
-        if action_type:
-            summary["selected_action_type"] = action_type
-            summary["selected_action_value"] = returned_rows[0].get("selected_action_value")
-            summary["selected_action_cost"] = returned_rows[0].get("selected_action_cost")
-    else:
-        summary = v91_aggregate_base(rows)
-        summary["available_actions_aggregated"] = v91_sum_action_catalogs(rows, "available_actions")
-        if action_type:
-            selected_value = sum(
-                safe_float(row.get("selected_action_value"))
-                for row in rows
-                if row.get("selected_action_found")
-            )
-            selected_cost = metric_round(
-                safe_float(summary.get("spend")) / selected_value, 4
-            ) if selected_value > 0 else None
-            summary["selected_action_type"] = action_type
-            summary["selected_action_value"] = metric_round(selected_value, 4)
-            summary["selected_action_cost_derived_for_selection"] = selected_cost
-
-    portfolio_source = setup_entities if level == "account" else rows
-    setup_portfolio = v91_build_setup_portfolio(portfolio_source)
-
-    result = {
-        "engine": "meta_driven_v9_1",
-        "period": {"since": since, "until": until},
-        "level": level,
-        "account_id": ad_account_id,
-        "matched_rows": len(rows),
-        "returned_rows": len(returned_rows),
-        "summary": summary,
-        "rows": returned_rows,
-        "setup_portfolio": setup_portfolio,
-        "setup_entities": setup_entities[:30] if level == "account" else None,
-        "meta_fields_used": {
-            "campaign_setup": metadata.get("fields_used", {}).get("campaign"),
-            "adset_setup": metadata.get("fields_used", {}).get("adset"),
-            "insights": insight_fields_used,
-        },
-        "interpretation_contract": {
-            "source_of_truth": "Meta Marketing API",
-            "do_not_assume_results_equals_leads": True,
-            "do_not_infer_kpi_from_campaign_name": True,
-            "first_choice": (
-                "Leia objective_results/cost_per_objective_result/cost_per_result quando a Meta os retornar."
-            ),
-            "fallback": (
-                "Se os campos contextualizados estiverem vazios, interprete objective + optimization_goal + "
-                "optimization_sub_event + promoted_object + destination_type e confronte com available_actions."
-            ),
-            "validation": (
-                "Ao escolher um action_type como resultado principal, use validar_resultado_meta antes de "
-                "tratar o evento como fato na resposta final."
-            ),
-        },
-    }
-    print("[V9.1] QUERY_META_DRIVEN_DONE", {
-        "rows": len(returned_rows),
-        "setup_groups": setup_portfolio.get("group_count"),
-        "action_type": action_type,
-    })
-    return result
-
-
-def validate_meta_result(
-    context,
-    since,
-    until,
-    level,
-    entity_id,
-    action_type,
-):
-    """
-    Valida uma interpretação feita pela IA sem possuir uma tabela de objetivos.
-    A IA escolhe o action_type; o backend confirma se a Meta realmente o retornou.
-    """
-    if level not in {"campaign", "adset", "ad"}:
-        raise ValueError("A validação de resultado exige level campaign, adset ou ad.")
-    if not entity_id or not action_type:
-        raise ValueError("entity_id e action_type são obrigatórios.")
-
-    report = query_meta_insights(
-        context,
-        since=since,
-        until=until,
-        level=level,
-        search=str(entity_id),
-        limit=100,
-        sort_by="spend",
-        sort_order="desc",
-        min_spend=0,
-        include_zero_spend=True,
-        action_type=str(action_type),
-    )
-
-    exact = None
-    for row in report.get("rows", []):
-        if str(entity_id_for_row(row, level)) == str(entity_id):
-            exact = row
-            break
-
-    if exact is None:
-        return {
-            "validated": False,
-            "reason": "entity_not_found",
-            "entity_id": entity_id,
-            "action_type": action_type,
-        }
-
-    found = bool(exact.get("selected_action_found"))
-    return {
-        "validated": found,
-        "entity_id": entity_id,
-        "entity_name": entity_name_for_row(exact, level),
-        "level": level,
-        "action_type": action_type,
-        "value": exact.get("selected_action_value"),
-        "cost_per_action": exact.get("selected_action_cost"),
-        "cost_source": exact.get("selected_action_cost_source"),
-        "spend": exact.get("spend"),
-        "meta_setup": exact.get("meta_setup"),
-        "meta_reported_result": exact.get("meta_reported_result"),
-        "available_action_types": sorted((exact.get("available_actions") or {}).keys())[:150],
-        "note": (
-            "validated=true significa apenas que esse action_type existe nos Insights retornados pela Meta. "
-            "A pertinência estratégica continua sendo uma interpretação do setup real."
-        ),
-    }
-
-
-def compare_meta_periods(
-    context,
-    mode,
-    level="account",
-    n_days=None,
-    period_a_since=None,
-    period_a_until=None,
-    period_b_since=None,
-    period_b_until=None,
-    period_a_label=None,
-    period_b_label=None,
-    search=None,
-    limit=25,
-    sort_by="spend",
-    action_type=None,
-):
-    periods = resolve_comparison_periods(
-        context,
-        mode,
-        n_days=n_days,
-        period_a_since=period_a_since,
-        period_a_until=period_a_until,
-        period_b_since=period_b_since,
-        period_b_until=period_b_until,
-        period_a_label=period_a_label,
-        period_b_label=period_b_label,
-    )
-
-    report_a = query_meta_insights(
-        context,
-        periods["a"]["since"], periods["a"]["until"],
-        level=level, search=search, limit=max(limit, 50), sort_by=sort_by,
-        sort_order="desc", include_zero_spend=True, action_type=action_type,
-    )
-    report_b = query_meta_insights(
-        context,
-        periods["b"]["since"], periods["b"]["until"],
-        level=level, search=search, limit=max(limit, 50), sort_by=sort_by,
-        sort_order="desc", include_zero_spend=True, action_type=action_type,
-    )
-
-    base_metrics = [
-        "spend", "impressions", "reach", "frequency", "clicks", "link_clicks",
-        "ctr", "link_ctr", "cpc", "link_cpc", "cpm", "landing_page_views",
-        "cost_per_landing_page_view",
-    ]
-    if action_type:
-        base_metrics += ["selected_action_value", "selected_action_cost"]
-
-    summary_deltas = {
-        metric: metric_delta(
-            report_a.get("summary", {}).get(metric),
-            report_b.get("summary", {}).get(metric),
-        )
-        for metric in base_metrics
-    }
-
-    entities = []
-    if level != "account":
-        rows_a = {
-            str(entity_id_for_row(row, level)): row
-            for row in report_a.get("rows", [])
-            if entity_id_for_row(row, level)
-        }
-        rows_b = {
-            str(entity_id_for_row(row, level)): row
-            for row in report_b.get("rows", [])
-            if entity_id_for_row(row, level)
-        }
-        for entity_id in set(rows_a) | set(rows_b):
-            a = rows_a.get(entity_id, {})
-            b = rows_b.get(entity_id, {})
-            base = b or a
-            sig_a = (a.get("meta_setup") or {}).get("setup_signature")
-            sig_b = (b.get("meta_setup") or {}).get("setup_signature")
-            setup_unchanged = not (sig_a and sig_b and sig_a != sig_b)
-            entities.append({
-                "id": entity_id,
-                "name": entity_name_for_row(base, level),
-                "setup_unchanged": setup_unchanged,
-                "period_a_setup": a.get("meta_setup"),
-                "period_b_setup": b.get("meta_setup"),
-                "period_a_meta_result": a.get("meta_reported_result"),
-                "period_b_meta_result": b.get("meta_reported_result"),
-                "period_a": {metric: a.get(metric) for metric in base_metrics},
-                "period_b": {metric: b.get(metric) for metric in base_metrics},
-                "deltas": {
-                    metric: metric_delta(a.get(metric), b.get(metric))
-                    for metric in base_metrics
-                },
-            })
-        entities.sort(
-            key=lambda item: safe_float(item.get("period_b", {}).get(sort_by)),
-            reverse=True,
-        )
-        entities = entities[:max(1, min(int(limit or 25), 50))]
-
-    return {
-        "engine": "meta_driven_v9_1",
-        "mode": mode,
-        "level": level,
-        "selected_action_type": action_type,
-        "period_a": {
-            **periods["a"],
-            "summary": report_a.get("summary"),
-            "setup_portfolio": report_a.get("setup_portfolio"),
-        },
-        "period_b": {
-            **periods["b"],
-            "summary": report_b.get("summary"),
-            "setup_portfolio": report_b.get("setup_portfolio"),
-        },
-        "summary_deltas_a_to_b": summary_deltas,
-        "entities": entities,
-        "guardrail": (
-            "Nenhum KPI principal foi escolhido pelo código. Compare a métrica compatível com o setup "
-            "retornado pela Meta; se usar action_type, valide-o. Se setup_unchanged=false, não atribua "
-            "a mudança apenas à performance, pois a configuração também mudou."
-        ),
-    }
-
-
-def list_meta_structure(context, level="campaign", search=None, limit=50):
-    """Lista a configuração REAL da Meta, sem mapear objetivo para KPI no código."""
-    if level not in {"campaign", "adset", "ad"}:
-        raise ValueError("level deve ser campaign, adset ou ad.")
-
-    ad_account_id, access_token, credential_error = get_meta_credentials(context)
-    if credential_error:
-        raise RuntimeError(credential_error)
-    metadata = v91_fetch_setup_metadata(ad_account_id, access_token)
-
-    if level == "campaign":
-        rows = []
-        for campaign_id, campaign in metadata.get("campaigns", {}).items():
-            children = metadata.get("adsets_by_campaign", {}).get(campaign_id, [])
-            variants = []
-            seen = set()
-            for adset in children:
-                signature = v91_setup_signature(campaign, adset)
-                if signature in seen:
-                    continue
-                seen.add(signature)
-                variants.append({
-                    "setup_signature": signature,
-                    "adset_setup": v91_adset_setup_view(adset),
-                })
-            rows.append({
-                "id": campaign_id,
-                "name": campaign.get("name"),
-                "campaign_setup": v91_campaign_setup_view(campaign),
-                "adset_setup_variants": variants,
-                "setup_variant_count": len(variants),
-                "requires_adset_drilldown": len(variants) > 1,
-            })
-    elif level == "adset":
-        rows = []
-        for adset_id, adset in metadata.get("adsets", {}).items():
-            campaign = metadata.get("campaigns", {}).get(str(adset.get("campaign_id") or ""), {})
-            rows.append({
-                "id": adset_id,
-                "name": adset.get("name"),
-                "campaign_setup": v91_campaign_setup_view(campaign),
-                "adset_setup": v91_adset_setup_view(adset),
-                "setup_signature": v91_setup_signature(campaign, adset),
-            })
-    else:
-        # Para anúncios buscamos somente identidade/hierarquia e anexamos o setup do conjunto/campanha.
-        ads_url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{ad_account_id}/ads"
-        ads, _ = v91_meta_get_edge_with_fallback(
-            ads_url,
-            access_token,
-            [
-                ["id", "name", "campaign_id", "adset_id", "status", "effective_status", "conversion_specs", "tracking_specs"],
-                ["id", "name", "campaign_id", "adset_id", "status", "effective_status"],
-                ["id", "name", "campaign_id", "adset_id"],
-            ],
-            limit=500,
-            max_pages=20,
-        )
-        rows = []
-        for ad in ads:
-            campaign = metadata.get("campaigns", {}).get(str(ad.get("campaign_id") or ""), {})
-            adset = metadata.get("adsets", {}).get(str(ad.get("adset_id") or ""), {})
-            rows.append({
-                "id": ad.get("id"),
-                "name": ad.get("name"),
-                "status": ad.get("status"),
-                "effective_status": ad.get("effective_status"),
-                "conversion_specs": v91_json_safe(ad.get("conversion_specs")),
-                "tracking_specs": v91_json_safe(ad.get("tracking_specs")),
-                "campaign_setup": v91_campaign_setup_view(campaign),
-                "adset_setup": v91_adset_setup_view(adset),
-                "setup_signature": v91_setup_signature(campaign, adset),
-            })
-
-    if search:
-        needle = normalize_text(str(search))
-        rows = [
-            row for row in rows
-            if needle in normalize_text(f"{row.get('id', '')} {row.get('name', '')}")
-        ]
-
-    limit = max(1, min(int(limit or 50), 100))
-    return {
-        "engine": "meta_driven_v9_1",
-        "level": level,
-        "matched_rows": len(rows),
-        "rows": rows[:limit],
-        "rule": "Configuração exibida como a Meta retornou; nenhum KPI foi pré-definido pelo backend.",
-    }
-
-
-DYNAMIC_ANALYSIS_TOOLS = [
-    {
-        "type": "function",
-        "name": "consultar_insights",
-        "description": (
-            "Consulta Insights e o setup real da Meta. Retorna objective/optimization_goal, campos "
-            "contextuais de resultado da própria Meta e catálogos de actions/cost_per_action_type. "
-            "Não pressupõe que resultado seja lead e não escolhe KPI por tabela fixa."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "since": {"type": "string", "description": "Data inicial inclusiva YYYY-MM-DD."},
-                "until": {"type": "string", "description": "Data final inclusiva YYYY-MM-DD."},
-                "level": {"type": "string", "enum": ["account", "campaign", "adset", "ad"]},
-                "search": {"type": ["string", "null"]},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                "sort_by": {"type": "string", "enum": sorted(V91_BASE_SORT_METRICS)},
-                "sort_order": {"type": "string", "enum": ["asc", "desc"]},
-                "min_spend": {"type": "number", "minimum": 0},
-                "include_zero_spend": {"type": "boolean"},
-                "action_type": {
-                    "type": ["string", "null"],
-                    "description": (
-                        "Use somente depois de identificar nos dados um action_type pertinente ao setup. "
-                        "O backend extrairá e validará esse evento sem possuir uma tabela fixa."
-                    ),
-                },
-            },
-            "required": ["since", "until", "level"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "type": "function",
-        "name": "comparar_periodos",
-        "description": (
-            "Compara períodos preservando o setup real retornado pela Meta. Não cria CPL/KPI universal. "
-            "Pode comparar um action_type escolhido após inspeção do setup."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "mode": {"type": "string", "enum": ["current_month_vs_previous_equivalent", "last_n_days_vs_previous_n_days", "custom"]},
-                "level": {"type": "string", "enum": ["account", "campaign", "adset", "ad"]},
-                "n_days": {"type": ["integer", "null"], "minimum": 1, "maximum": 365},
-                "period_a_since": {"type": ["string", "null"]},
-                "period_a_until": {"type": ["string", "null"]},
-                "period_b_since": {"type": ["string", "null"]},
-                "period_b_until": {"type": ["string", "null"]},
-                "period_a_label": {"type": ["string", "null"]},
-                "period_b_label": {"type": ["string", "null"]},
-                "search": {"type": ["string", "null"]},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
-                "sort_by": {"type": "string", "enum": sorted(V91_BASE_SORT_METRICS)},
-                "action_type": {"type": ["string", "null"]},
-            },
-            "required": ["mode", "level"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "type": "function",
-        "name": "listar_estrutura_meta",
-        "description": (
-            "Lê da própria Meta o setup técnico: campaign objective, optimization_goal, "
-            "optimization_sub_event, billing_event, promoted_object, destination_type e campos disponíveis. "
-            "Use para entender para que a campanha/conjunto foi configurado antes de julgá-lo."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "level": {"type": "string", "enum": ["campaign", "adset", "ad"]},
-                "search": {"type": ["string", "null"]},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-            },
-            "required": ["level"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "type": "function",
-        "name": "validar_resultado_meta",
-        "description": (
-            "Depois de interpretar o setup e escolher um action_type como resultado pertinente, valida "
-            "contra os Insights da Meta se esse evento realmente existe para a entidade e retorna valor/custo."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "since": {"type": "string"},
-                "until": {"type": "string"},
-                "level": {"type": "string", "enum": ["campaign", "adset", "ad"]},
-                "entity_id": {"type": "string"},
-                "action_type": {"type": "string"},
-            },
-            "required": ["since", "until", "level", "entity_id", "action_type"],
-            "additionalProperties": False,
-        },
-    },
-]
-
-
-def build_dynamic_instructions(context):
-    today = get_today_for_context(context)
-    return f"""
-Você é um analista sênior de Meta Ads dentro de um SaaS multiempresa.
-Seu trabalho é entender o SETUP REAL retornado pela Meta e só então avaliar performance.
-
-Empresa: {context.get('company_name')}.
-Conta Meta: {context.get('ad_account_id') or 'nenhuma'}.
-Data atual na timezone da conta: {today.isoformat()}.
-
-REGRA CENTRAL DA V9.1
-A Meta é a fonte da verdade sobre o que uma campanha/conjunto foi configurado para buscar.
-NÃO existe, neste sistema, uma tabela fixa de "objetivo -> KPI" que você deva seguir.
-NÃO deduza o objetivo pelo nome da campanha.
-NÃO trate "Resultados" como sinônimo de lead.
-
-ORDEM OBRIGATÓRIA DE RACIOCÍNIO
-1. Leia o campaign objective retornado pela Meta.
-2. Leia o setup do conjunto: optimization_goal, optimization_sub_event, billing_event, promoted_object, destination_type e demais campos disponíveis.
-3. Verifique os campos de resultado que os próprios Insights retornaram:
-   - objective_results
-   - cost_per_objective_result
-   - cost_per_result
-   - objective_result_rate
-4. Se esses campos estiverem preenchidos e coerentes com o setup, dê prioridade a eles como representação contextual do resultado da Meta.
-5. Se estiverem ausentes/insuficientes, confronte o setup com available_actions e available_cost_per_action.
-6. Se você escolher um action_type específico como resultado principal, use validar_resultado_meta antes de tratá-lo como fato na resposta final.
-7. Se houver ambiguidade real, NÃO force um KPI. Diga o que está ambíguo e aprofunde em adset/estrutura.
-
-CAMPANHA COM VÁRIOS CONJUNTOS
-- O objective é de campanha, mas o optimization_goal é do conjunto.
-- Se requires_adset_drilldown=true ou setup_variant_count > 1, não imponha um único resultado principal à campanha sem olhar os conjuntos.
-- Uma campanha pode reunir conjuntos com setups diferentes. Nesse caso, analise por conjunto antes de concluir.
-
-CONTA COM SETUPS MISTOS
-- Nunca divida todo o gasto da conta por uma única conversão para inventar um custo universal.
-- Use setup_portfolio para entender como o investimento está distribuído.
-- Compare eficiência entre entidades somente quando o resultado analisado é semanticamente comparável.
-
-SOBRE LEADS, COMPRAS, MENSAGENS E OUTROS EVENTOS
-- Eles podem aparecer em available_actions mesmo sem serem o resultado otimizado daquela campanha.
-- A presença de um evento NÃO prova que ele seja o KPI principal.
-- A ausência de um evento também NÃO prova falha se a campanha não foi configurada para buscá-lo.
-
-SOBRE OS 61 "RESULTADOS" DO ADS MANAGER
-- Não tente reproduzir "Resultados" usando uma regra fixa.
-- Primeiro procure objective_results/cost_per_objective_result/cost_per_result da própria Meta.
-- Se esses campos não vierem, use o setup real + actions e valide o action_type escolhido.
-- Se não for possível reconciliar exatamente com a interface, diga isso claramente em vez de inventar.
-
-PROTOCOLO ANALÍTICO
-- Comece pela conclusão, não por uma lista de números.
-- Use 2 a 4 números que sustentam o diagnóstico.
-- Número é evidência; não é a análise.
-- Priorize o que é material para o objetivo real daquele setup.
-- Separe fato, leitura e hipótese.
-- Mudança de métrica não prova causa.
-- Se a pergunta exigir aprofundamento, navegue conta -> campanha -> conjunto -> anúncio.
-
-PERÍODOS
-- Sem período explícito: use o mês atual até hoje, salvo contexto anterior.
-- "este mês x mês passado" com mês incompleto: current_month_vs_previous_equivalent.
-- Datas/meses completos explícitos: custom.
-- Últimos N dias: compare blocos equivalentes.
-- Em follow-up, preserve período e entidade da conversa.
-
-FORMATO DE RESPOSTA
-Para análise estratégica, prefira:
-
-🧠 DIAGNÓSTICO
-Uma conclusão clara e contextualizada pelo setup real da Meta.
-
-📌 EVIDÊNCIAS
-Somente 2 a 4 dados relevantes ao resultado/objetivo identificado.
-
-🔎 LEITURA
-Explique o que os dados significam em conjunto. Marque hipóteses como hipótese.
-
-🎯 PRÓXIMA AÇÃO
-Uma ação ou aprofundamento concreto e priorizado.
-
-FORMATAÇÃO WHATSAPP
-- Sem #, ##, **, _, crases ou tabelas Markdown.
-- Títulos em MAIÚSCULAS com no máximo um emoji.
-- Parágrafos curtos.
-- O backend fará sanitização final.
-"""
-
-
-def execute_dynamic_tool(context, tool_name, arguments):
-    print(f"[DYNAMIC] TOOL_EXECUTE name={tool_name} args={arguments}")
-
-    if tool_name == "consultar_insights":
-        return query_meta_insights(
-            context,
-            since=arguments["since"],
-            until=arguments["until"],
-            level=arguments.get("level", "account"),
-            search=arguments.get("search"),
-            limit=arguments.get("limit", 25),
-            sort_by=arguments.get("sort_by", "spend"),
-            sort_order=arguments.get("sort_order", "desc"),
-            min_spend=arguments.get("min_spend", 0),
-            include_zero_spend=arguments.get("include_zero_spend", True),
-            action_type=arguments.get("action_type"),
-        )
-
-    if tool_name == "comparar_periodos":
-        return compare_meta_periods(
-            context,
-            mode=arguments["mode"],
-            level=arguments.get("level", "account"),
-            n_days=arguments.get("n_days"),
-            period_a_since=arguments.get("period_a_since"),
-            period_a_until=arguments.get("period_a_until"),
-            period_b_since=arguments.get("period_b_since"),
-            period_b_until=arguments.get("period_b_until"),
-            period_a_label=arguments.get("period_a_label"),
-            period_b_label=arguments.get("period_b_label"),
-            search=arguments.get("search"),
-            limit=arguments.get("limit", 25),
-            sort_by=arguments.get("sort_by", "spend"),
-            action_type=arguments.get("action_type"),
-        )
-
-    if tool_name == "listar_estrutura_meta":
-        return list_meta_structure(
-            context,
-            level=arguments["level"],
-            search=arguments.get("search"),
-            limit=arguments.get("limit", 50),
-        )
-
-    if tool_name == "validar_resultado_meta":
-        return validate_meta_result(
-            context,
-            since=arguments["since"],
-            until=arguments["until"],
-            level=arguments["level"],
-            entity_id=arguments["entity_id"],
-            action_type=arguments["action_type"],
-        )
-
-    raise ValueError(f"Tool desconhecida: {tool_name}")
-
-
-@app.route("/v91-capabilities", methods=["GET"])
-def v91_capabilities():
-    return {
-        "build_id": BUILD_ID,
-        "engine": "meta_driven_v9_1",
-        "objective_mapping_hardcoded": False,
-        "meta_setup_fields": [
-            "campaign.objective",
-            "adset.optimization_goal",
-            "adset.optimization_sub_event",
-            "adset.billing_event",
-            "adset.promoted_object",
-            "adset.destination_type",
-        ],
-        "meta_result_fields_attempted": [
-            "objective_results",
-            "cost_per_objective_result",
-            "cost_per_result",
-            "objective_result_rate",
-            "actions",
-            "cost_per_action_type",
-            "action_values",
-        ],
-        "validation_rule": "AI interprets setup; backend validates selected action_type against Meta Insights.",
-    }, 200
 
 # =========================================================
 # START
