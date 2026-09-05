@@ -31,7 +31,7 @@ from psycopg.rows import dict_row
 
 app = Flask(__name__)
 
-BUILD_ID = "v10.3-budget-intelligence-permissions-2026-09-04"
+BUILD_ID = "v10.4-phone-identity-permission-fix-2026-09-04"
 ANALYSIS_ENGINE = "meta_driven_v9_1_action_ai_v10_2"
 OBJECTIVE_MAPPING_HARDCODED = False
 print("BOOT BUILD_ID:", BUILD_ID)
@@ -595,8 +595,55 @@ def initialize_database():
 # UTILIDADES DE BANCO
 # =========================================================
 
+def phone_lookup_candidates(number):
+    """
+    Gera candidatos seguros para identificar o mesmo WhatsApp quando o número
+    brasileiro aparece com/sem +55 ou com a variante histórica sem o 9º dígito.
+    O valor exato sempre vem primeiro e nunca atualizamos múltiplos usuários em lote.
+    """
+    digits = normalize_phone_number(number)
+    if not digits:
+        return []
+
+    candidates = []
+
+    def add(value):
+        value = normalize_phone_number(value)
+        if value and value not in candidates:
+            candidates.append(value)
+
+    add(digits)
+
+    # Brasil: aceita forma nacional e internacional.
+    if digits.startswith("55") and len(digits) in {12, 13}:
+        national = digits[2:]
+        add(national)
+    elif len(digits) in {10, 11}:
+        national = digits
+        add("55" + national)
+    else:
+        national = None
+
+    if national and len(national) == 11 and national[2] == "9":
+        # DDD + 9 + número de 8 dígitos -> também considera cadastro legado sem o 9.
+        legacy = national[:2] + national[3:]
+        add(legacy)
+        add("55" + legacy)
+    elif national and len(national) == 10 and national[2] in "6789":
+        # Cadastro legado de celular sem o 9º dígito -> considera versão moderna.
+        modern = national[:2] + "9" + national[2:]
+        add(modern)
+        add("55" + modern)
+
+    return candidates
+
+
 def get_user_context(whatsapp_number):
     initialize_database()
+    exact = normalize_phone_number(whatsapp_number)
+    candidates = phone_lookup_candidates(exact)
+    if not candidates:
+        return None
 
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
@@ -628,15 +675,33 @@ def get_user_context(whatsapp_number):
                     AND m.active = TRUE
                     AND m.selected = TRUE
                 WHERE
-                    u.whatsapp_number = %s
+                    u.whatsapp_number = ANY(%s)
                     AND u.active = TRUE
                     AND c.active = TRUE
-                ORDER BY m.id ASC
-                LIMIT 1;
+                ORDER BY
+                    CASE WHEN u.whatsapp_number = %s THEN 0 ELSE 1 END,
+                    u.id ASC,
+                    m.id ASC;
                 """,
-                (whatsapp_number,),
+                (candidates, exact),
             )
-            return cursor.fetchone()
+            rows = cursor.fetchall()
+
+    if not rows:
+        return None
+
+    exact_rows = [row for row in rows if row.get("whatsapp_number") == exact]
+    if exact_rows:
+        return exact_rows[0]
+
+    user_ids = {row.get("user_id") for row in rows}
+    if len(user_ids) > 1:
+        print("[V10.4] PHONE_LOOKUP_AMBIGUOUS", {"input": exact, "candidates": candidates, "user_ids": sorted(user_ids)})
+        return None
+
+    row = rows[0]
+    print("[V10.4] PHONE_ALIAS_MATCH", {"input": exact, "stored": row.get("whatsapp_number"), "user_id": row.get("user_id")})
+    return row
 
 
 def log_activity(context, action, details=None):
@@ -730,7 +795,7 @@ def create_slug(name):
 
 
 def normalize_phone_number(number):
-    return "".join(char for char in number if char.isdigit())
+    return "".join(char for char in str(number or "") if char.isdigit())
 
 
 def create_client(company_name, whatsapp_number, can_read_ads, can_manage_ads, can_create_campaigns):
@@ -742,12 +807,14 @@ def create_client(company_name, whatsapp_number, can_read_ads, can_manage_ads, c
 
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
+            candidates = phone_lookup_candidates(whatsapp_number)
             cursor.execute(
-                "SELECT id FROM users WHERE whatsapp_number = %s;",
-                (whatsapp_number,),
+                "SELECT id, whatsapp_number FROM users WHERE whatsapp_number = ANY(%s) AND active=TRUE LIMIT 1;",
+                (candidates,),
             )
-            if cursor.fetchone():
-                return None, "Esse WhatsApp já está cadastrado."
+            existing = cursor.fetchone()
+            if existing:
+                return None, f"Esse WhatsApp já está cadastrado como {existing['whatsapp_number']}."
 
             slug = create_slug(company_name)
 
@@ -800,24 +867,60 @@ def create_client(company_name, whatsapp_number, can_read_ads, can_manage_ads, c
 
 def update_client_permissions(whatsapp_number, can_read_ads, can_manage_ads, can_create_campaigns):
     initialize_database()
-    whatsapp_number = normalize_phone_number(whatsapp_number)
+    exact = normalize_phone_number(whatsapp_number)
+    candidates = phone_lookup_candidates(exact)
+    if not candidates:
+        return None, "Número de WhatsApp inválido."
+
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, company_id, whatsapp_number
+                FROM users
+                WHERE whatsapp_number = ANY(%s) AND active=TRUE
+                ORDER BY CASE WHEN whatsapp_number=%s THEN 0 ELSE 1 END, id ASC;
+                """,
+                (candidates, exact),
+            )
+            matches = cursor.fetchall()
+
+            if not matches:
+                return None, "Cliente não encontrado. Use o número exibido pelo comando 'quem sou eu' no WhatsApp do cliente."
+
+            exact_matches = [row for row in matches if row.get("whatsapp_number") == exact]
+            if exact_matches:
+                target = exact_matches[0]
+            else:
+                distinct_ids = {row.get("id") for row in matches}
+                if len(distinct_ids) > 1:
+                    numbers = ", ".join(str(row.get("whatsapp_number")) for row in matches[:5])
+                    return None, (
+                        "Encontrei mais de um cadastro compatível com esse número. "
+                        f"Cadastros: {numbers}. Use exatamente o número mostrado em 'quem sou eu'."
+                    )
+                target = matches[0]
+
             cursor.execute(
                 """
                 UPDATE users
                 SET can_read_ads=%s,
                     can_manage_ads=%s,
                     can_create_campaigns=%s
-                WHERE whatsapp_number=%s AND active=TRUE
+                WHERE id=%s AND active=TRUE
                 RETURNING id, company_id, whatsapp_number, can_read_ads, can_manage_ads, can_create_campaigns;
                 """,
-                (can_read_ads, can_manage_ads, can_create_campaigns, whatsapp_number),
+                (can_read_ads, can_manage_ads, can_create_campaigns, target["id"]),
             )
             row = cursor.fetchone()
+
     if not row:
-        return None, "Cliente não encontrado."
-    return dict(row), None
+        return None, "Não consegui atualizar o usuário encontrado."
+
+    result = dict(row)
+    result["requested_number"] = exact
+    result["matched_by_alias"] = (result.get("whatsapp_number") != exact)
+    return result, None
 
 
 def list_clients():
@@ -3689,10 +3792,12 @@ def receive_webhook():
                 sender,
                 (
                     "✅ PERMISSÕES ATUALIZADAS\n\n"
-                    f"WhatsApp: {updated['whatsapp_number']}\n"
-                    f"Consulta Ads: {'SIM' if updated['can_read_ads'] else 'NÃO'}\n"
-                    f"Gerencia Ads: {'SIM' if updated['can_manage_ads'] else 'NÃO'}\n"
-                    f"Cria campanhas: {'SIM' if updated['can_create_campaigns'] else 'NÃO'}"
+                    f"Usuário: #{updated['id']}\n"
+                    f"WhatsApp reconhecido: {updated['whatsapp_number']}\n"
+                    + (f"Número informado: {updated.get('requested_number')}\n" if updated.get('matched_by_alias') else "")
+                    + f"Consulta Ads: {'SIM' if updated['can_read_ads'] else 'NÃO'}\n"
+                    + f"Gerencia Ads: {'SIM' if updated['can_manage_ads'] else 'NÃO'}\n"
+                    + f"Cria campanhas: {'SIM' if updated['can_create_campaigns'] else 'NÃO'}"
                 ),
             )
             return "EVENT_RECEIVED", 200
@@ -3725,13 +3830,22 @@ def receive_webhook():
                 send_whatsapp_message(
                     sender,
                     (
-                        "🔐 PERMISSÕES DA CONEXÃO META\n\n"
-                        f"Leitura de Ads: {'SIM' if status.get('ads_read') else 'NÃO'}\n"
-                        f"Gerenciamento de Ads: {'SIM' if status.get('ads_management') else 'NÃO'}\n\n"
+                        "🔐 PERMISSÕES DO ACESSO\n\n"
+                        "*Plataforma — este WhatsApp*\n"
+                        f"Consulta Ads: {'SIM' if context.get('can_read_ads') else 'NÃO'}\n"
+                        f"Gerencia Ads: {'SIM' if context.get('can_manage_ads') else 'NÃO'}\n"
+                        f"Cria campanhas: {'SIM' if context.get('can_create_campaigns') else 'NÃO'}\n\n"
+                        "*Meta — conexão atual*\n"
+                        f"ads_read: {'SIM' if status.get('ads_read') else 'NÃO'}\n"
+                        f"ads_management: {'SIM' if status.get('ads_management') else 'NÃO'}\n\n"
                         + (
-                            "A conexão está apta para ações de gerenciamento."
-                            if status.get("ads_management")
-                            else "Para alterar orçamento, pausar ou reativar, a conexão precisa conceder ads_management."
+                            "✅ Este acesso está pronto para gerenciar anúncios."
+                            if status.get("ads_management") and context.get("can_manage_ads")
+                            else (
+                                "⚠️ A Meta permite gerenciar, mas este WhatsApp ainda está bloqueado pela permissão interna da plataforma."
+                                if status.get("ads_management") and not context.get("can_manage_ads")
+                                else "⚠️ A conexão Meta ainda não concedeu ads_management."
+                            )
                         )
                     ),
                 )
@@ -3757,7 +3871,8 @@ def receive_webhook():
                 (
                     "👤 *USUÁRIO IDENTIFICADO*\n\n"
                     f"*Empresa:*\n{context['company_name']}\n\n"
-                    f"*WhatsApp:*\n{context['whatsapp_number']}\n\n"
+                    f"*Usuário interno:*\n#{context['user_id']}\n\n"
+                    f"*WhatsApp reconhecido:*\n{context['whatsapp_number']}\n\n"
                     f"*Conta Meta:*\n{conta}\n\n"
                     f"*Pode consultar Ads:*\n{leitura}\n\n"
                     f"*Pode gerenciar Ads:*\n{gestao}\n\n"
@@ -7405,6 +7520,8 @@ def v10_capabilities():
         "review_watcher_enabled": REVIEW_WATCH_ENABLED,
         "writes_require_confirmation": True,
         "separate_manage_permission": True,
+        "phone_identity_alias_resolution": True,
+        "permission_update_by_user_id_after_match": True,
         "meta_ads_management_check": True,
         "budget_intelligence": True,
         "new_structures_forced_paused": True,
