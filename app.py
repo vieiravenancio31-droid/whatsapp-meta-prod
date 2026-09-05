@@ -31,7 +31,7 @@ from psycopg.rows import dict_row
 
 app = Flask(__name__)
 
-BUILD_ID = "v10.2-hybrid-wizard-media-progress-2026-09-04"
+BUILD_ID = "v10.3-budget-intelligence-permissions-2026-09-04"
 ANALYSIS_ENGINE = "meta_driven_v9_1_action_ai_v10_2"
 OBJECTIVE_MAPPING_HARDCODED = False
 print("BOOT BUILD_ID:", BUILD_ID)
@@ -227,6 +227,7 @@ def initialize_database():
                         name TEXT,
                         role TEXT NOT NULL DEFAULT 'user',
                         can_read_ads BOOLEAN NOT NULL DEFAULT TRUE,
+                        can_manage_ads BOOLEAN NOT NULL DEFAULT FALSE,
                         can_create_campaigns BOOLEAN NOT NULL DEFAULT FALSE,
                         is_platform_admin BOOLEAN NOT NULL DEFAULT FALSE,
                         active BOOLEAN NOT NULL DEFAULT TRUE,
@@ -239,6 +240,14 @@ def initialize_database():
                     """
                     ALTER TABLE users
                     ADD COLUMN IF NOT EXISTS is_platform_admin BOOLEAN
+                    NOT NULL DEFAULT FALSE;
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    ALTER TABLE users
+                    ADD COLUMN IF NOT EXISTS can_manage_ads BOOLEAN
                     NOT NULL DEFAULT FALSE;
                     """
                 )
@@ -529,15 +538,17 @@ def initialize_database():
                             name,
                             role,
                             can_read_ads,
+                            can_manage_ads,
                             can_create_campaigns,
                             is_platform_admin
                         )
-                        VALUES (%s, %s, %s, 'admin', TRUE, TRUE, TRUE)
+                        VALUES (%s, %s, %s, 'admin', TRUE, TRUE, TRUE, TRUE)
                         ON CONFLICT (whatsapp_number)
                         DO UPDATE SET
                             company_id = EXCLUDED.company_id,
                             role = 'admin',
                             can_read_ads = TRUE,
+                            can_manage_ads = TRUE,
                             can_create_campaigns = TRUE,
                             is_platform_admin = TRUE,
                             active = TRUE;
@@ -597,6 +608,7 @@ def get_user_context(whatsapp_number):
                     u.name AS user_name,
                     u.role,
                     u.can_read_ads,
+                    u.can_manage_ads,
                     u.can_create_campaigns,
                     u.is_platform_admin,
                     c.id AS company_id,
@@ -721,7 +733,7 @@ def normalize_phone_number(number):
     return "".join(char for char in number if char.isdigit())
 
 
-def create_client(company_name, whatsapp_number, can_read_ads, can_create_campaigns):
+def create_client(company_name, whatsapp_number, can_read_ads, can_manage_ads, can_create_campaigns):
     initialize_database()
     whatsapp_number = normalize_phone_number(whatsapp_number)
 
@@ -757,10 +769,11 @@ def create_client(company_name, whatsapp_number, can_read_ads, can_create_campai
                     name,
                     role,
                     can_read_ads,
+                    can_manage_ads,
                     can_create_campaigns,
                     is_platform_admin
                 )
-                VALUES (%s, %s, %s, 'admin', %s, %s, FALSE)
+                VALUES (%s, %s, %s, 'admin', %s, %s, %s, FALSE)
                 RETURNING id;
                 """,
                 (
@@ -768,6 +781,7 @@ def create_client(company_name, whatsapp_number, can_read_ads, can_create_campai
                     whatsapp_number,
                     "Administrador",
                     can_read_ads,
+                    can_manage_ads,
                     can_create_campaigns,
                 ),
             )
@@ -779,8 +793,31 @@ def create_client(company_name, whatsapp_number, can_read_ads, can_create_campai
         "company_name": company_name,
         "whatsapp_number": whatsapp_number,
         "can_read_ads": can_read_ads,
+        "can_manage_ads": can_manage_ads,
         "can_create_campaigns": can_create_campaigns,
     }, None
+
+
+def update_client_permissions(whatsapp_number, can_read_ads, can_manage_ads, can_create_campaigns):
+    initialize_database()
+    whatsapp_number = normalize_phone_number(whatsapp_number)
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE users
+                SET can_read_ads=%s,
+                    can_manage_ads=%s,
+                    can_create_campaigns=%s
+                WHERE whatsapp_number=%s AND active=TRUE
+                RETURNING id, company_id, whatsapp_number, can_read_ads, can_manage_ads, can_create_campaigns;
+                """,
+                (can_read_ads, can_manage_ads, can_create_campaigns, whatsapp_number),
+            )
+            row = cursor.fetchone()
+    if not row:
+        return None, "Cliente não encontrado."
+    return dict(row), None
 
 
 def list_clients():
@@ -795,6 +832,7 @@ def list_clients():
                     c.name AS company_name,
                     u.whatsapp_number,
                     u.can_read_ads,
+                    u.can_manage_ads,
                     u.can_create_campaigns,
                     m.ad_account_id
                 FROM companies c
@@ -3554,15 +3592,19 @@ def receive_webhook():
 
             parts = [item.strip() for item in original_text.split("|")]
 
-            if len(parts) != 5:
+            # Novo formato: leitura | gerenciamento | criação.
+            # O formato legado com 2 permissões continua aceito e usa gerenciamento=criação.
+            if len(parts) not in {5, 6}:
                 send_whatsapp_message(
                     sender,
                     (
-                        "❌ *FORMATO INCORRETO*\n\n"
-                        "Use exatamente:\n\n"
-                        "cadastrar cliente | Nome da empresa | 5531999999999 | sim | nao\n\n"
-                        "O primeiro SIM/NAO = leitura.\n"
-                        "O segundo SIM/NAO = criação."
+                        "❌ FORMATO INCORRETO\n\n"
+                        "Use:\n"
+                        "cadastrar cliente | Nome da empresa | 5531999999999 | sim | sim | nao\n\n"
+                        "1º SIM/NAO = consultar Ads\n"
+                        "2º SIM/NAO = gerenciar Ads (orçamento, pausa, ajustes)\n"
+                        "3º SIM/NAO = criar campanhas\n\n"
+                        "O formato antigo com apenas leitura e criação ainda funciona."
                     ),
                 )
                 return "EVENT_RECEIVED", 200
@@ -3570,27 +3612,27 @@ def receive_webhook():
             company_name = parts[1]
             new_whatsapp = parts[2]
             read_permission = text_to_bool(parts[3])
-            create_permission = text_to_bool(parts[4])
+            if len(parts) == 6:
+                manage_permission = text_to_bool(parts[4])
+                create_permission = text_to_bool(parts[5])
+            else:
+                create_permission = text_to_bool(parts[4])
+                manage_permission = create_permission
 
-            if read_permission is None or create_permission is None:
-                send_whatsapp_message(
-                    sender,
-                    "❌ Nas permissões use apenas SIM ou NAO.",
-                )
+            if read_permission is None or manage_permission is None or create_permission is None:
+                send_whatsapp_message(sender, "❌ Nas permissões use apenas SIM ou NAO.")
                 return "EVENT_RECEIVED", 200
 
             client, error = create_client(
                 company_name,
                 new_whatsapp,
                 read_permission,
+                manage_permission,
                 create_permission,
             )
 
             if error:
-                send_whatsapp_message(
-                    sender,
-                    f"❌ Não consegui cadastrar o cliente.\n\n{error}",
-                )
+                send_whatsapp_message(sender, f"❌ Não consegui cadastrar o cliente.\n\n{error}")
                 return "EVENT_RECEIVED", 200
 
             log_activity(context, "client_created", client)
@@ -3598,10 +3640,59 @@ def receive_webhook():
             send_whatsapp_message(
                 sender,
                 (
-                    "✅ *CLIENTE CADASTRADO*\n\n"
-                    f"*Empresa:*\n{company_name}\n\n"
-                    f"*WhatsApp:*\n{client['whatsapp_number']}\n\n"
-                    "O cliente já pode enviar *conectar meta* para vincular a própria conta."
+                    "✅ CLIENTE CADASTRADO\n\n"
+                    f"Empresa: {company_name}\n"
+                    f"WhatsApp: {client['whatsapp_number']}\n\n"
+                    f"Consulta Ads: {'SIM' if client['can_read_ads'] else 'NÃO'}\n"
+                    f"Gerencia Ads: {'SIM' if client['can_manage_ads'] else 'NÃO'}\n"
+                    f"Cria campanhas: {'SIM' if client['can_create_campaigns'] else 'NÃO'}\n\n"
+                    "O cliente já pode enviar conectar meta para vincular a própria conta."
+                ),
+            )
+            return "EVENT_RECEIVED", 200
+
+        if received_text.startswith("permissoes cliente") or received_text.startswith("permissões cliente"):
+            if not context["is_platform_admin"]:
+                send_whatsapp_message(sender, "⛔ Este comando é exclusivo do administrador da plataforma.")
+                return "EVENT_RECEIVED", 200
+
+            parts = [item.strip() for item in original_text.split("|")]
+            if len(parts) != 5:
+                send_whatsapp_message(
+                    sender,
+                    (
+                        "❌ FORMATO INCORRETO\n\n"
+                        "Use:\n"
+                        "permissoes cliente | 5531999999999 | sim | sim | nao\n\n"
+                        "1º = consultar Ads\n2º = gerenciar Ads\n3º = criar campanhas"
+                    ),
+                )
+                return "EVENT_RECEIVED", 200
+
+            target_phone = parts[1]
+            read_permission = text_to_bool(parts[2])
+            manage_permission = text_to_bool(parts[3])
+            create_permission = text_to_bool(parts[4])
+            if read_permission is None or manage_permission is None or create_permission is None:
+                send_whatsapp_message(sender, "❌ Nas permissões use apenas SIM ou NAO.")
+                return "EVENT_RECEIVED", 200
+
+            updated, error = update_client_permissions(
+                target_phone, read_permission, manage_permission, create_permission
+            )
+            if error:
+                send_whatsapp_message(sender, f"❌ {error}")
+                return "EVENT_RECEIVED", 200
+
+            log_activity(context, "client_permissions_updated", updated)
+            send_whatsapp_message(
+                sender,
+                (
+                    "✅ PERMISSÕES ATUALIZADAS\n\n"
+                    f"WhatsApp: {updated['whatsapp_number']}\n"
+                    f"Consulta Ads: {'SIM' if updated['can_read_ads'] else 'NÃO'}\n"
+                    f"Gerencia Ads: {'SIM' if updated['can_manage_ads'] else 'NÃO'}\n"
+                    f"Cria campanhas: {'SIM' if updated['can_create_campaigns'] else 'NÃO'}"
                 ),
             )
             return "EVENT_RECEIVED", 200
@@ -3620,9 +3711,35 @@ def receive_webhook():
                     f"\n*{client['company_name']}*\n"
                     f"WhatsApp: {client['whatsapp_number']}\n"
                     f"Meta: {conta}\n"
+                    f"Leitura: {'SIM' if client['can_read_ads'] else 'NÃO'} | "
+                    f"Gestão: {'SIM' if client['can_manage_ads'] else 'NÃO'} | "
+                    f"Criação: {'SIM' if client['can_create_campaigns'] else 'NÃO'}\n"
                 )
 
             send_whatsapp_message(sender, "".join(lines))
+            return "EVENT_RECEIVED", 200
+
+        if received_text in {"permissoes meta", "permissões meta", "ver permissoes meta", "ver permissões meta"}:
+            status = meta_permission_status(context)
+            if status.get("verified"):
+                send_whatsapp_message(
+                    sender,
+                    (
+                        "🔐 PERMISSÕES DA CONEXÃO META\n\n"
+                        f"Leitura de Ads: {'SIM' if status.get('ads_read') else 'NÃO'}\n"
+                        f"Gerenciamento de Ads: {'SIM' if status.get('ads_management') else 'NÃO'}\n\n"
+                        + (
+                            "A conexão está apta para ações de gerenciamento."
+                            if status.get("ads_management")
+                            else "Para alterar orçamento, pausar ou reativar, a conexão precisa conceder ads_management."
+                        )
+                    ),
+                )
+            else:
+                send_whatsapp_message(
+                    sender,
+                    "⚠️ Não consegui confirmar as permissões do token agora. A conta continua disponível para os testes de leitura.",
+                )
             return "EVENT_RECEIVED", 200
 
         # =================================================
@@ -3632,6 +3749,7 @@ def receive_webhook():
         if received_text == "quem sou eu":
             conta = context.get("ad_account_id") or "Não selecionada"
             leitura = "SIM" if context["can_read_ads"] else "NÃO"
+            gestao = "SIM" if context["can_manage_ads"] else "NÃO"
             criacao = "SIM" if context["can_create_campaigns"] else "NÃO"
 
             send_whatsapp_message(
@@ -3642,6 +3760,7 @@ def receive_webhook():
                     f"*WhatsApp:*\n{context['whatsapp_number']}\n\n"
                     f"*Conta Meta:*\n{conta}\n\n"
                     f"*Pode consultar Ads:*\n{leitura}\n\n"
+                    f"*Pode gerenciar Ads:*\n{gestao}\n\n"
                     f"*Pode criar campanhas:*\n{criacao}"
                 ),
             )
@@ -4000,7 +4119,9 @@ def v91_fetch_setup_metadata(ad_account_id, access_token):
         [
             "id", "name", "objective", "status", "effective_status", "buying_type",
             "bid_strategy", "promoted_object", "smart_promotion_type",
-            "special_ad_categories",
+            "special_ad_categories", "daily_budget", "lifetime_budget",
+            "budget_remaining", "spend_cap", "is_adset_budget_sharing_enabled",
+            "start_time", "stop_time",
         ],
         ["id", "name", "objective", "status", "effective_status", "buying_type", "bid_strategy"],
         ["id", "name", "objective", "status", "effective_status", "buying_type"],
@@ -4009,7 +4130,9 @@ def v91_fetch_setup_metadata(ad_account_id, access_token):
         [
             "id", "name", "campaign_id", "optimization_goal", "optimization_sub_event",
             "billing_event", "bid_strategy", "promoted_object", "destination_type",
-            "attribution_spec", "status", "effective_status",
+            "attribution_spec", "status", "effective_status", "daily_budget",
+            "lifetime_budget", "budget_remaining", "daily_spend_cap",
+            "lifetime_spend_cap", "start_time", "end_time",
         ],
         [
             "id", "name", "campaign_id", "optimization_goal", "billing_event",
@@ -4081,6 +4204,11 @@ def v91_adset_setup_view(adset):
         "attribution_spec": v91_json_safe(adset.get("attribution_spec")),
         "status": adset.get("status"),
         "effective_status": adset.get("effective_status"),
+        "budget_raw_minor_units": {
+            "daily_budget": adset.get("daily_budget"),
+            "lifetime_budget": adset.get("lifetime_budget"),
+            "budget_remaining": adset.get("budget_remaining"),
+        },
     }
 
 
@@ -4098,6 +4226,12 @@ def v91_campaign_setup_view(campaign):
         "special_ad_categories": v91_json_safe(campaign.get("special_ad_categories")),
         "status": campaign.get("status"),
         "effective_status": campaign.get("effective_status"),
+        "budget_raw_minor_units": {
+            "daily_budget": campaign.get("daily_budget"),
+            "lifetime_budget": campaign.get("lifetime_budget"),
+            "budget_remaining": campaign.get("budget_remaining"),
+            "spend_cap": campaign.get("spend_cap"),
+        },
     }
 
 
@@ -4944,6 +5078,316 @@ def currency_to_minor(context, amount_major):
     return int(round(amount * multiplier))
 
 
+
+def currency_to_major(context, amount_minor):
+    if amount_minor in (None, ""):
+        return None
+    try:
+        value = float(amount_minor)
+    except (TypeError, ValueError):
+        return None
+    currency = str(context.get("meta_currency") or "BRL").upper()
+    divisor = 1 if currency in ZERO_DECIMAL_CURRENCIES else 100
+    return metric_round(value / divisor, 2)
+
+
+def meta_permission_status(context):
+    """Lê as permissões efetivamente concedidas ao token sem expor o token."""
+    if not context.get("ad_account_id"):
+        return {"verified": False, "error": "Nenhuma conta Meta selecionada.", "granted": []}
+    try:
+        data = meta_graph_get(context, "me/permissions")
+        rows = data.get("data") or []
+        granted = sorted({
+            str(row.get("permission"))
+            for row in rows
+            if str(row.get("status") or "").lower() == "granted" and row.get("permission")
+        })
+        return {
+            "verified": True,
+            "granted": granted,
+            "ads_read": "ads_read" in granted or "ads_management" in granted,
+            "ads_management": "ads_management" in granted,
+        }
+    except Exception as error:
+        print("[V10.3] META_PERMISSION_CHECK_FAILED", repr(error))
+        return {"verified": False, "error": str(error), "granted": []}
+
+
+def ensure_meta_ads_management(context):
+    status = meta_permission_status(context)
+    if status.get("verified") and not status.get("ads_management"):
+        raise PermissionError(
+            "A conexão Meta atual não concedeu ads_management. "
+            "Ela pode consultar dados, mas não pode alterar orçamento/status. "
+            "Libere ads_management no Facebook Login for Business/Meta App e reconecte esta empresa."
+        )
+    return status
+
+
+def budget_status_is_active(row):
+    return str(row.get("status") or "").upper() == "ACTIVE" or str(row.get("effective_status") or "").upper() == "ACTIVE"
+
+
+def query_meta_budgets(context, search=None, active_only=False, limit=100):
+    if not context.get("can_read_ads"):
+        raise PermissionError("Este usuário não possui permissão para consultar Meta Ads.")
+
+    ad_account_id, access_token, credential_error = get_meta_credentials(context)
+    if credential_error:
+        raise RuntimeError(credential_error)
+
+    campaigns_url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{ad_account_id}/campaigns"
+    adsets_url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{ad_account_id}/adsets"
+
+    campaigns, campaign_fields = v91_meta_get_edge_with_fallback(
+        campaigns_url,
+        access_token,
+        [
+            ["id", "name", "account_id", "status", "effective_status", "objective", "daily_budget", "lifetime_budget", "budget_remaining", "spend_cap", "bid_strategy", "is_adset_budget_sharing_enabled", "start_time", "stop_time"],
+            ["id", "name", "account_id", "status", "effective_status", "objective", "daily_budget", "lifetime_budget", "budget_remaining", "bid_strategy"],
+            ["id", "name", "account_id", "status", "effective_status", "objective", "daily_budget", "lifetime_budget"],
+            ["id", "name", "account_id", "status", "effective_status", "objective"],
+        ],
+        limit=500,
+        max_pages=20,
+    )
+    adsets, adset_fields = v91_meta_get_edge_with_fallback(
+        adsets_url,
+        access_token,
+        [
+            ["id", "name", "account_id", "campaign_id", "status", "effective_status", "daily_budget", "lifetime_budget", "budget_remaining", "start_time", "end_time"],
+            ["id", "name", "account_id", "campaign_id", "status", "effective_status", "daily_budget", "lifetime_budget"],
+            ["id", "name", "account_id", "campaign_id", "status", "effective_status"],
+        ],
+        limit=500,
+        max_pages=20,
+    )
+
+    adsets_by_campaign = {}
+    for adset in adsets:
+        adsets_by_campaign.setdefault(str(adset.get("campaign_id") or ""), []).append(adset)
+
+    needle = normalize_text(search or "") if search else None
+    rows = []
+    for campaign in campaigns:
+        if active_only and not budget_status_is_active(campaign):
+            continue
+        if needle and needle not in normalize_text(f"{campaign.get('id', '')} {campaign.get('name', '')}"):
+            continue
+
+        campaign_id = str(campaign.get("id") or "")
+        children = adsets_by_campaign.get(campaign_id, [])
+        child_rows = []
+        for adset in children:
+            child_rows.append({
+                "id": str(adset.get("id") or ""),
+                "name": adset.get("name"),
+                "status": adset.get("status"),
+                "effective_status": adset.get("effective_status"),
+                "active": budget_status_is_active(adset),
+                "daily_budget": currency_to_major(context, adset.get("daily_budget")),
+                "lifetime_budget": currency_to_major(context, adset.get("lifetime_budget")),
+                "budget_remaining": currency_to_major(context, adset.get("budget_remaining")),
+                "start_time": adset.get("start_time"),
+                "end_time": adset.get("end_time"),
+            })
+
+        campaign_daily = currency_to_major(context, campaign.get("daily_budget"))
+        campaign_lifetime = currency_to_major(context, campaign.get("lifetime_budget"))
+        campaign_remaining = currency_to_major(context, campaign.get("budget_remaining"))
+        campaign_spend_cap = currency_to_major(context, campaign.get("spend_cap"))
+        active_adsets_with_daily = [a for a in child_rows if a["active"] and a.get("daily_budget") not in (None, 0)]
+        active_adsets_with_lifetime = [a for a in child_rows if a["active"] and a.get("lifetime_budget") not in (None, 0)]
+
+        has_campaign_budget = campaign_daily not in (None, 0) or campaign_lifetime not in (None, 0)
+        has_adset_budget = bool(active_adsets_with_daily or active_adsets_with_lifetime)
+        if has_campaign_budget and has_adset_budget:
+            source = "mixed_or_meta_specific"
+        elif has_campaign_budget:
+            source = "campaign"
+        elif has_adset_budget:
+            source = "adsets"
+        else:
+            source = "not_exposed_or_no_budget"
+
+        rows.append({
+            "campaign_id": campaign_id,
+            "campaign_name": campaign.get("name"),
+            "objective": campaign.get("objective"),
+            "status": campaign.get("status"),
+            "effective_status": campaign.get("effective_status"),
+            "active": budget_status_is_active(campaign),
+            "budget_source": source,
+            "campaign_budget": {
+                "daily_budget": campaign_daily,
+                "lifetime_budget": campaign_lifetime,
+                "budget_remaining": campaign_remaining,
+                "spend_cap": campaign_spend_cap,
+            },
+            "adsets": child_rows,
+            "active_adset_daily_budget_total": metric_round(sum(a["daily_budget"] for a in active_adsets_with_daily), 2),
+            "active_adset_lifetime_budget_total": metric_round(sum(a["lifetime_budget"] for a in active_adsets_with_lifetime), 2),
+            "budget_control_note": (
+                "Orçamento controlado na campanha."
+                if source == "campaign"
+                else "Orçamento controlado nos conjuntos de anúncios."
+                if source == "adsets"
+                else "A estrutura exige leitura cuidadosa antes de alterar orçamento."
+            ),
+        })
+
+    limit = max(1, min(int(limit or 100), 200))
+    rows = rows[:limit]
+    return {
+        "currency": str(context.get("meta_currency") or "BRL").upper(),
+        "active_only": bool(active_only),
+        "campaign_count": len(rows),
+        "campaign_fields_used": campaign_fields,
+        "adset_fields_used": adset_fields,
+        "campaigns": rows,
+        "important": (
+            "Orçamento configurado não é gasto realizado. daily_budget/lifetime_budget são lidos da estrutura Meta; "
+            "spend continua vindo de Insights. Não invente orçamento diário a partir do gasto."
+        ),
+    }
+
+
+def compute_new_budget(current, mode, amount):
+    current = float(current)
+    amount = float(amount)
+    if mode == "set":
+        new_value = amount
+    elif mode == "decrease_by":
+        new_value = current - amount
+    elif mode == "increase_by":
+        new_value = current + amount
+    elif mode == "decrease_percent":
+        new_value = current * (1 - amount / 100.0)
+    elif mode == "increase_percent":
+        new_value = current * (1 + amount / 100.0)
+    else:
+        raise ValueError("Modo de orçamento inválido.")
+    if new_value <= 0:
+        raise ValueError("A alteração deixaria o orçamento em zero ou negativo.")
+    return metric_round(new_value, 2)
+
+
+def propose_budget_change(context, mode, amount_major, campaign_ids=None, search=None, active_only=True):
+    if not context.get("can_manage_ads"):
+        raise PermissionError(
+            "Este usuário pode consultar a Meta, mas o gerenciamento está desativado na plataforma. "
+            "O administrador precisa liberar can_manage_ads."
+        )
+    ensure_meta_ads_management(context)
+
+    report = query_meta_budgets(context, search=search, active_only=active_only, limit=200)
+    wanted = {str(x) for x in (campaign_ids or []) if x}
+    campaigns = [c for c in report["campaigns"] if not wanted or c["campaign_id"] in wanted]
+    if not campaigns:
+        return {"proposed": False, "reason": "Nenhuma campanha compatível foi encontrada."}
+
+    items = []
+    unresolved = []
+    for campaign in campaigns:
+        source = campaign.get("budget_source")
+        if source == "campaign":
+            cb = campaign.get("campaign_budget") or {}
+            if cb.get("daily_budget") not in (None, 0):
+                kind, current = "daily_budget", cb["daily_budget"]
+            elif cb.get("lifetime_budget") not in (None, 0):
+                if mode != "set":
+                    unresolved.append({
+                        "campaign_id": campaign["campaign_id"],
+                        "campaign_name": campaign["campaign_name"],
+                        "reason": "A campanha usa orçamento vitalício; uma alteração 'por dia' não pode ser inferida com segurança.",
+                    })
+                    continue
+                kind, current = "lifetime_budget", cb["lifetime_budget"]
+            else:
+                unresolved.append({"campaign_id": campaign["campaign_id"], "campaign_name": campaign["campaign_name"], "reason": "Orçamento não exposto pela Meta."})
+                continue
+            new_value = compute_new_budget(current, mode, amount_major)
+            items.append({
+                "target_type": "campaign",
+                "target_id": campaign["campaign_id"],
+                "target_name": campaign["campaign_name"],
+                "budget_kind": kind,
+                "expected_current_amount_major": current,
+                "amount_major": new_value,
+            })
+            continue
+
+        if source == "adsets":
+            active_daily = [a for a in campaign.get("adsets") or [] if a.get("active") and a.get("daily_budget") not in (None, 0)]
+            if len(active_daily) == 1:
+                adset = active_daily[0]
+                current = adset["daily_budget"]
+                new_value = compute_new_budget(current, mode, amount_major)
+                items.append({
+                    "target_type": "adset",
+                    "target_id": adset["id"],
+                    "target_name": f"{campaign['campaign_name']} / {adset['name']}",
+                    "campaign_id": campaign["campaign_id"],
+                    "budget_kind": "daily_budget",
+                    "expected_current_amount_major": current,
+                    "amount_major": new_value,
+                })
+            else:
+                unresolved.append({
+                    "campaign_id": campaign["campaign_id"],
+                    "campaign_name": campaign["campaign_name"],
+                    "reason": (
+                        "O orçamento está distribuído entre vários conjuntos ativos. "
+                        "Preciso saber em quais conjuntos aplicar a alteração; não vou distribuir automaticamente."
+                    ),
+                    "active_adsets": active_daily,
+                })
+            continue
+
+        unresolved.append({
+            "campaign_id": campaign["campaign_id"],
+            "campaign_name": campaign["campaign_name"],
+            "reason": "A Meta não retornou uma fonte única de orçamento que eu possa alterar com segurança.",
+        })
+
+    if not items:
+        return {
+            "proposed": False,
+            "requires_clarification": True,
+            "unresolved": unresolved,
+            "instruction": "Explique em linguagem simples por que não é seguro alterar e peça a escolha necessária.",
+        }
+
+    summary_lines = []
+    for item in items[:20]:
+        summary_lines.append(
+            f"{item['target_name']}: {item['expected_current_amount_major']} -> {item['amount_major']} "
+            f"({item['budget_kind']})"
+        )
+    summary = "Alterar orçamento após confirmação: " + "; ".join(summary_lines)
+    if len(items) > 20:
+        summary += f"; +{len(items)-20} itens"
+
+    action = create_pending_action(
+        context,
+        action_type="batch_set_budget",
+        target_type=None,
+        target_id=None,
+        spec={"items": items, "mode": mode, "requested_amount_major": float(amount_major)},
+        summary=summary,
+    )
+    return {
+        "proposed": True,
+        "action": action,
+        "currency": report["currency"],
+        "changes": items,
+        "unresolved": unresolved,
+        "confirmation_required": True,
+        "instruction": "Mostre antes/depois de forma clara e peça confirmação. Nada foi alterado ainda.",
+    }
+
+
 def is_explicit_confirmation_text(text):
     n = normalize_text(text or "")
     negative = ["nao", "não", "cancela", "cancelar", "deixa", "nao faca", "não faça"]
@@ -4971,6 +5415,8 @@ def action_summary(action_type, target_type, target_id, spec, summary=None):
         return f"Alterar {target_type} {target_id} para {spec.get('status')}."
     if action_type == "set_budget":
         return f"Alterar orçamento de {target_type} {target_id} para {spec.get('amount_major')} {spec.get('budget_kind', 'daily_budget')}."
+    if action_type == "batch_set_budget":
+        return f"Alterar orçamento de {len(spec.get('items') or [])} estrutura(s), após validação do valor atual."
     if action_type == "duplicate":
         return f"Duplicar {target_type} {target_id} mantendo a cópia pausada."
     if action_type == "create_pixel":
@@ -4986,8 +5432,18 @@ def validate_action_request(context, action_type, target_type=None, target_id=No
     spec = dict(spec or {})
     if not ACTION_AI_ENABLED:
         raise RuntimeError("Action AI está desativitado no ambiente.")
-    if not context.get("can_create_campaigns"):
-        raise PermissionError("Este usuário não possui permissão de escrita na Meta.")
+
+    manage_actions = {"set_status", "set_budget", "batch_set_budget", "update_adset", "create_pixel", "activate_structure"}
+    create_actions = {"duplicate"}
+    if action_type in manage_actions and not context.get("can_manage_ads"):
+        raise PermissionError(
+            "Este usuário pode consultar Ads, mas não possui permissão de gerenciamento na plataforma. "
+            "Libere can_manage_ads para orçamento, pausa, reativação e ajustes."
+        )
+    if action_type in create_actions and not context.get("can_create_campaigns"):
+        raise PermissionError("Este usuário não possui permissão para criar/duplicar estruturas.")
+    if action_type in manage_actions or action_type in create_actions:
+        ensure_meta_ads_management(context)
 
     if action_type in {"set_status", "set_budget", "duplicate", "update_adset"}:
         ensure_target_belongs_to_account(context, target_type, target_id)
@@ -5006,6 +5462,29 @@ def validate_action_request(context, action_type, target_type=None, target_id=No
             raise ValueError("budget_kind inválido.")
         spec["amount_major"] = float(spec.get("amount_major"))
         spec["budget_kind"] = kind
+
+    elif action_type == "batch_set_budget":
+        items = list(spec.get("items") or [])
+        if not items:
+            raise ValueError("Nenhum orçamento foi informado para alteração.")
+        normalized = []
+        for item in items:
+            item = dict(item or {})
+            item_target_type = item.get("target_type")
+            item_target_id = item.get("target_id")
+            if item_target_type not in {"campaign", "adset"}:
+                raise ValueError("batch_set_budget aceita apenas campaign/adset.")
+            ensure_target_belongs_to_account(context, item_target_type, item_target_id)
+            kind = item.get("budget_kind", "daily_budget")
+            if kind not in {"daily_budget", "lifetime_budget"}:
+                raise ValueError("budget_kind inválido em alteração múltipla.")
+            amount = float(item.get("amount_major"))
+            if amount <= 0:
+                raise ValueError("Novo orçamento precisa ser maior que zero.")
+            expected = item.get("expected_current_amount_major")
+            expected = float(expected) if expected is not None else None
+            normalized.append({**item, "budget_kind": kind, "amount_major": amount, "expected_current_amount_major": expected})
+        spec["items"] = normalized
 
     elif action_type == "duplicate":
         if target_type not in ACTION_TARGET_TYPES:
@@ -5112,12 +5591,62 @@ def execute_action_spec(context, action):
         return {"target_type": target_type, "target_id": target_id, "status": spec["status"], "meta": result}
 
     if action_type == "set_budget":
+        expected = spec.get("expected_current_amount_major")
+        if expected is not None:
+            current_data = meta_graph_get(context, str(target_id), fields=f"id,name,{spec['budget_kind']}")
+            current = currency_to_major(context, current_data.get(spec["budget_kind"]))
+            if current is None or abs(float(current) - float(expected)) > 0.01:
+                raise RuntimeError(
+                    f"O orçamento mudou desde a proposta. Esperado: {expected}; atual: {current}. "
+                    "A ação foi interrompida para evitar uma alteração desatualizada."
+                )
         amount_minor = currency_to_minor(context, spec["amount_major"])
         result = meta_graph_post(context, str(target_id), {spec["budget_kind"]: amount_minor})
         return {
             "target_type": target_type, "target_id": target_id,
             "budget_kind": spec["budget_kind"], "amount_major": spec["amount_major"],
             "amount_minor": amount_minor, "currency": context.get("meta_currency") or "BRL", "meta": result,
+        }
+
+    if action_type == "batch_set_budget":
+        items = spec["items"]
+        preflight = []
+        for item in items:
+            current_data = meta_graph_get(
+                context,
+                str(item["target_id"]),
+                fields=f"id,name,account_id,{item['budget_kind']}",
+            )
+            current = currency_to_major(context, current_data.get(item["budget_kind"]))
+            expected = item.get("expected_current_amount_major")
+            if expected is not None and (current is None or abs(float(current) - float(expected)) > 0.01):
+                raise RuntimeError(
+                    f"O orçamento de '{item.get('target_name') or item['target_id']}' mudou desde a proposta "
+                    f"({expected} -> {current}). Nenhuma alteração do lote foi executada."
+                )
+            preflight.append({**item, "current_verified_major": current})
+
+        results = []
+        for item in preflight:
+            amount_minor = currency_to_minor(context, item["amount_major"])
+            meta_result = meta_graph_post(
+                context,
+                str(item["target_id"]),
+                {item["budget_kind"]: amount_minor},
+            )
+            results.append({
+                "target_type": item["target_type"],
+                "target_id": item["target_id"],
+                "target_name": item.get("target_name"),
+                "before": item.get("current_verified_major"),
+                "after": item["amount_major"],
+                "budget_kind": item["budget_kind"],
+                "meta": meta_result,
+            })
+        return {
+            "currency": context.get("meta_currency") or "BRL",
+            "changed_count": len(results),
+            "changes": results,
         }
 
     if action_type == "duplicate":
@@ -6250,6 +6779,49 @@ ACTION_AI_TOOLS = [
     },
     {
         "type": "function",
+        "name": "consultar_orcamentos",
+        "description": (
+            "Consulta o orçamento CONFIGURADO na Meta, separado de gasto. Identifica se o orçamento é controlado "
+            "na campanha ou nos conjuntos e retorna daily_budget/lifetime_budget em moeda da conta."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "search": {"type": ["string", "null"]},
+                "active_only": {"type": "boolean"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "propor_alteracao_orcamento",
+        "description": (
+            "Prepara uma alteração segura de orçamento sem executar. Use para definir, aumentar ou reduzir orçamento. "
+            "O backend lê o valor atual, identifica campanha vs conjunto, calcula o novo valor e cria UMA confirmação pendente."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["set", "decrease_by", "increase_by", "decrease_percent", "increase_percent"]},
+                "amount_major": {"type": "number", "exclusiveMinimum": 0},
+                "campaign_ids": {"type": ["array", "null"], "items": {"type": "string"}},
+                "search": {"type": ["string", "null"]},
+                "active_only": {"type": "boolean"},
+            },
+            "required": ["mode", "amount_major"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "diagnosticar_permissoes_meta",
+        "description": "Mostra permissões internas da plataforma e verifica se o token Meta concedeu ads_management.",
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "type": "function",
         "name": "criar_estrutura_pausada",
         "description": (
             "Fluxo legado de criação pausada. Na conversa normal com cliente, prefira SEMPRE o Campaign Wizard V10.2. "
@@ -6554,10 +7126,21 @@ Sua campanha está criada, porém pausada.
 
 - Não ative a estrutura no mesmo turno da criação. A ativação fica como ação pendente separada.
 
+ORÇAMENTO — REGRA OBRIGATÓRIA V10.3
+- Nunca use gasto de Insights como se fosse orçamento configurado.
+- Quando o cliente perguntar verba/orçamento diário, use consultar_orcamentos.
+- A Meta pode controlar orçamento na campanha OU nos conjuntos. Descubra onde está antes de responder ou alterar.
+- Se houver daily_budget, apresente como orçamento diário. Se houver apenas lifetime_budget, diga que é orçamento vitalício; não invente valor diário.
+- Para aumentar/reduzir/definir orçamento, prefira propor_alteracao_orcamento. O backend calcula o novo valor a partir da Meta e cria uma única ação pendente.
+- Se uma campanha tiver vários conjuntos controlando orçamento e o pedido não disser como distribuir, NÃO distribua por conta própria. Peça esclarecimento.
+- Antes de executar orçamento, o backend confere novamente o valor atual para evitar alteração com dado desatualizado.
+- can_manage_ads controla pausa, reativação, orçamento e ajustes. can_create_campaigns é separado e não deve bloquear uma simples gestão.
+- Se a Meta não tiver ads_management concedido ao token, explique que a conexão precisa ser reconectada depois que essa permissão estiver liberada.
+
 AÇÕES EM ESTRUTURAS EXISTENTES
 Use propor_acao_meta para:
 - pausar/reativar campanha, conjunto ou anúncio (set_status);
-- alterar orçamento de campanha/conjunto (set_budget);
+- para orçamento, prefira propor_alteracao_orcamento; set_budget fica como ferramenta técnica para um alvo já identificado;
 - duplicar campanha/conjunto/anúncio, sempre com cópia PAUSED (duplicate);
 - alterar targeting, posicionamentos, otimização, evento/destino e outros campos permitidos do conjunto (update_adset);
 - criar Pixel (create_pixel).
@@ -6697,6 +7280,38 @@ def execute_dynamic_tool(context, tool_name, arguments):
     if tool_name == "listar_acoes_pendentes":
         return list_pending_actions(context)
 
+    if tool_name == "consultar_orcamentos":
+        return query_meta_budgets(
+            context,
+            search=arguments.get("search"),
+            active_only=arguments.get("active_only", False),
+            limit=arguments.get("limit", 100),
+        )
+
+    if tool_name == "propor_alteracao_orcamento":
+        return propose_budget_change(
+            context,
+            mode=arguments["mode"],
+            amount_major=arguments["amount_major"],
+            campaign_ids=arguments.get("campaign_ids"),
+            search=arguments.get("search"),
+            active_only=arguments.get("active_only", True),
+        )
+
+    if tool_name == "diagnosticar_permissoes_meta":
+        meta_status = meta_permission_status(context)
+        return {
+            "platform": {
+                "can_read_ads": bool(context.get("can_read_ads")),
+                "can_manage_ads": bool(context.get("can_manage_ads")),
+                "can_create_campaigns": bool(context.get("can_create_campaigns")),
+            },
+            "meta": meta_status,
+            "write_ready": bool(context.get("can_manage_ads")) and (
+                meta_status.get("ads_management") if meta_status.get("verified") else None
+            ),
+        }
+
     if tool_name == "criar_estrutura_pausada":
         return create_paused_structure(
             context,
@@ -6759,6 +7374,8 @@ def v91_capabilities():
             "adset.billing_event",
             "adset.promoted_object",
             "adset.destination_type",
+            "campaign.daily_budget/lifetime_budget",
+            "adset.daily_budget/lifetime_budget",
         ],
         "meta_result_fields_attempted": [
             "objective_results",
@@ -6774,6 +7391,7 @@ def v91_capabilities():
 
 @app.route("/v10-capabilities", methods=["GET"])
 @app.route("/v102-capabilities", methods=["GET"])
+@app.route("/v103-capabilities", methods=["GET"])
 def v10_capabilities():
     return {
         "build_id": BUILD_ID,
@@ -6786,10 +7404,15 @@ def v10_capabilities():
         "transcribe_model": OPENAI_TRANSCRIBE_MODEL,
         "review_watcher_enabled": REVIEW_WATCH_ENABLED,
         "writes_require_confirmation": True,
+        "separate_manage_permission": True,
+        "meta_ads_management_check": True,
+        "budget_intelligence": True,
         "new_structures_forced_paused": True,
         "supported_actions": [
             "pause_activate_campaign_adset_ad",
-            "change_budget_campaign_adset",
+            "read_configured_budget_campaign_adset",
+            "change_budget_campaign_adset_with_preflight",
+            "batch_budget_change_with_single_confirmation",
             "update_adset_targeting_optimization",
             "duplicate_campaign_adset_ad_paused",
             "create_campaign_adset_ad_paused",
