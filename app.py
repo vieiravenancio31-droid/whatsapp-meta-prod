@@ -31,7 +31,7 @@ from psycopg.rows import dict_row
 
 app = Flask(__name__)
 
-BUILD_ID = "v10.7-native-rollback-openai-resilience-2026-09-04"
+BUILD_ID = "v10.8-tool-loop-guard-token-control-2026-09-04"
 ANALYSIS_ENGINE = "meta_driven_v9_1_action_ai_v10_2"
 OBJECTIVE_MAPPING_HARDCODED = False
 print("BOOT BUILD_ID:", BUILD_ID)
@@ -85,6 +85,19 @@ if OPENAI_ANALYSIS_REASONING_EFFORT not in {
     "none", "low", "medium", "high", "xhigh", "max"
 }:
     OPENAI_ANALYSIS_REASONING_EFFORT = "medium"
+
+# V10.8 — proteção contra loops de ferramentas e consumo explosivo de tokens.
+# Quatro rodadas são suficientes para o fluxo normal conta -> campanha -> conjunto/anúncio -> validação.
+# No limite, o backend força uma resposta final sem permitir nova ferramenta, em vez de falhar.
+try:
+    MAX_DYNAMIC_TOOL_ROUNDS = max(2, min(int(os.getenv("MAX_DYNAMIC_TOOL_ROUNDS", "4")), 8))
+except ValueError:
+    MAX_DYNAMIC_TOOL_ROUNDS = 4
+
+try:
+    MAX_DYNAMIC_TOOL_CALLS_PER_REQUEST = max(4, min(int(os.getenv("MAX_DYNAMIC_TOOL_CALLS_PER_REQUEST", "12")), 30))
+except ValueError:
+    MAX_DYNAMIC_TOOL_CALLS_PER_REQUEST = 12
 
 # V10 — áudio e Action AI
 OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe")
@@ -2235,6 +2248,13 @@ def build_user_friendly_error(error, stage="solicitação"):
             "Nenhuma reversão ficou aplicada. Você pode tentar novamente mais tarde."
         )
 
+    if "limite seguro de ferramentas" in normalized or "rodadas de ferramentas" in normalized:
+        return (
+            "⚠️ NÃO CONSEGUI FINALIZAR A ANÁLISE\n\n"
+            "A consulta exigiu mais etapas do que o limite seguro desta solicitação.\n\n"
+            "Nenhuma nova alteração foi executada automaticamente. Tente reformular o pedido de forma mais específica."
+        )
+
     if "expirada" in normalized or "expired" in normalized or "oauth" in normalized or "access token" in normalized:
         return (
             "🔐 PRECISO RECONECTAR A META\n\n"
@@ -3385,6 +3405,51 @@ def create_dynamic_openai_response(context, user_question, previous_response_id=
     return openai_client.responses.create(**kwargs)
 
 
+def _dynamic_tool_signature(call):
+    """Assinatura estável para detectar a mesma ferramenta com os mesmos argumentos no mesmo pedido."""
+    try:
+        parsed = json.loads(call.arguments or "{}")
+        args_key = json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    except Exception:
+        args_key = str(call.arguments or "")
+    return f"{getattr(call, 'name', '')}|{args_key}"
+
+
+def _log_dynamic_openai_usage(response, label):
+    """Loga apenas contadores de tokens; não registra prompt, resposta nem segredos."""
+    try:
+        usage = getattr(response, "usage", None)
+        if not usage:
+            return
+        print(
+            "[DYNAMIC] OPENAI_USAGE",
+            {
+                "label": label,
+                "input_tokens": getattr(usage, "input_tokens", None),
+                "output_tokens": getattr(usage, "output_tokens", None),
+                "total_tokens": getattr(usage, "total_tokens", None),
+            },
+        )
+    except Exception as usage_error:
+        print("[DYNAMIC] OPENAI_USAGE_LOG_ERROR", repr(usage_error))
+
+
+def _continue_dynamic_openai_response(context, previous_response_id, tool_outputs, force_final=False):
+    kwargs = {
+        "model": OPENAI_ANALYSIS_MODEL,
+        "reasoning": {"effort": OPENAI_ANALYSIS_REASONING_EFFORT},
+        "max_output_tokens": 1200,
+        "instructions": build_dynamic_instructions(context),
+        "tools": DYNAMIC_ANALYSIS_TOOLS,
+        "tool_choice": "none" if force_final else "auto",
+        "parallel_tool_calls": False,
+        "store": True,
+        "previous_response_id": previous_response_id,
+        "input": tool_outputs,
+    }
+    return openai_client.responses.create(**kwargs)
+
+
 def run_dynamic_openai_analysis(context, user_question):
     state = get_ai_conversation_state(context["user_id"])
     previous_response_id = state.get("previous_response_id") if state else None
@@ -3395,6 +3460,8 @@ def run_dynamic_openai_analysis(context, user_question):
             "model": OPENAI_ANALYSIS_MODEL,
             "reasoning_effort": OPENAI_ANALYSIS_REASONING_EFFORT,
             "has_previous_response": bool(previous_response_id),
+            "max_tool_rounds": MAX_DYNAMIC_TOOL_ROUNDS,
+            "max_tool_calls": MAX_DYNAMIC_TOOL_CALLS_PER_REQUEST,
         },
     )
 
@@ -3419,6 +3486,7 @@ def run_dynamic_openai_analysis(context, user_question):
         else:
             raise
 
+    _log_dynamic_openai_usage(response, "first")
     print(
         "[DYNAMIC] OPENAI_FIRST_RESPONSE",
         {
@@ -3427,8 +3495,10 @@ def run_dynamic_openai_analysis(context, user_question):
         },
     )
 
-    max_tool_rounds = 8
-    for round_number in range(1, max_tool_rounds + 1):
+    seen_tool_signatures = set()
+    total_tool_calls = 0
+
+    for round_number in range(1, MAX_DYNAMIC_TOOL_ROUNDS + 1):
         tool_calls = [
             item for item in response.output
             if getattr(item, "type", None) == "function_call"
@@ -3448,28 +3518,49 @@ def run_dynamic_openai_analysis(context, user_question):
         )
 
         tool_outputs = []
+        repeated_call_detected = False
+
         for call in tool_calls:
-            try:
-                args = json.loads(call.arguments or "{}")
-            except json.JSONDecodeError as error:
+            total_tool_calls += 1
+            signature = _dynamic_tool_signature(call)
+
+            if signature in seen_tool_signatures:
+                repeated_call_detected = True
+                print(
+                    "[DYNAMIC] DUPLICATE_TOOL_CALL_BLOCKED",
+                    {"round": round_number, "name": getattr(call, "name", None)},
+                )
                 tool_result = {
                     "ok": False,
-                    "error": f"Argumentos inválidos da ferramenta: {error}",
+                    "duplicate_call": True,
+                    "error": (
+                        "Esta mesma ferramenta com os mesmos argumentos já foi executada neste pedido. "
+                        "Use o resultado anterior que já está no contexto e finalize a resposta ao cliente."
+                    ),
                 }
             else:
+                seen_tool_signatures.add(signature)
                 try:
-                    result = execute_dynamic_tool(context, call.name, args)
-                    tool_result = {"ok": True, "data": result}
-                except Exception as tool_error:
-                    print(
-                        f"[DYNAMIC] TOOL_ERROR name={call.name}",
-                        repr(tool_error),
-                    )
-                    traceback.print_exc()
+                    args = json.loads(call.arguments or "{}")
+                except json.JSONDecodeError as error:
                     tool_result = {
                         "ok": False,
-                        "error": str(tool_error),
+                        "error": f"Argumentos inválidos da ferramenta: {error}",
                     }
+                else:
+                    try:
+                        result = execute_dynamic_tool(context, call.name, args)
+                        tool_result = {"ok": True, "data": result}
+                    except Exception as tool_error:
+                        print(
+                            f"[DYNAMIC] TOOL_ERROR name={call.name}",
+                            repr(tool_error),
+                        )
+                        traceback.print_exc()
+                        tool_result = {
+                            "ok": False,
+                            "error": str(tool_error),
+                        }
 
             tool_outputs.append(
                 {
@@ -3483,26 +3574,31 @@ def run_dynamic_openai_analysis(context, user_question):
                 }
             )
 
+        # Três gatilhos encerram a investigação e obrigam a IA a responder em linguagem natural:
+        # 1) repetiu exatamente uma ferramenta; 2) chegou ao teto de chamadas; 3) chegou à última rodada.
+        force_final = (
+            repeated_call_detected
+            or total_tool_calls >= MAX_DYNAMIC_TOOL_CALLS_PER_REQUEST
+            or round_number >= MAX_DYNAMIC_TOOL_ROUNDS
+        )
+
         print(
             "[DYNAMIC] OPENAI_CONTINUATION_CALL",
             {
                 "previous_response_id": response.id,
                 "tool_outputs": len(tool_outputs),
+                "force_final": force_final,
+                "total_tool_calls": total_tool_calls,
             },
         )
 
-        response = openai_client.responses.create(
-            model=OPENAI_ANALYSIS_MODEL,
-            reasoning={"effort": OPENAI_ANALYSIS_REASONING_EFFORT},
-            max_output_tokens=1200,
-            instructions=build_dynamic_instructions(context),
-            tools=DYNAMIC_ANALYSIS_TOOLS,
-            tool_choice="auto",
-            parallel_tool_calls=False,
-            store=True,
+        response = _continue_dynamic_openai_response(
+            context,
             previous_response_id=response.id,
-            input=tool_outputs,
+            tool_outputs=tool_outputs,
+            force_final=force_final,
         )
+        _log_dynamic_openai_usage(response, f"tool_round_{round_number}")
 
         print(
             "[DYNAMIC] OPENAI_CONTINUATION_RESPONSE",
@@ -3511,10 +3607,24 @@ def run_dynamic_openai_analysis(context, user_question):
                 "output_types": [
                     getattr(item, "type", None) for item in response.output
                 ],
+                "forced_final": force_final,
             },
         )
 
-    raise RuntimeError("Limite de rodadas de ferramentas excedido.")
+        if force_final:
+            # tool_choice='none' impede nova chamada de ferramenta. Se ainda assim não vier texto,
+            # falhamos de forma explícita em vez de entrar em loop e consumir mais tokens.
+            final_text = (response.output_text or "").strip()
+            if not final_text:
+                raise RuntimeError(
+                    "A IA concluiu a coleta de dados, mas não conseguiu formular a resposta final."
+                )
+            save_ai_conversation_state(context, response.id)
+            final_text = clean_ai_text_for_whatsapp(final_text)
+            return final_text, response.id
+
+    # Proteção defensiva: o fluxo normal retorna dentro do loop.
+    raise RuntimeError("A análise atingiu o limite seguro de ferramentas sem resposta final.")
 
 
 def acquire_analysis_lock(user_id):
@@ -8256,6 +8366,7 @@ def v91_capabilities():
 @app.route("/v105-capabilities", methods=["GET"])
 @app.route("/v106-capabilities", methods=["GET"])
 @app.route("/v107-capabilities", methods=["GET"])
+@app.route("/v108-capabilities", methods=["GET"])
 def v10_capabilities():
     return {
         "build_id": BUILD_ID,
@@ -8280,6 +8391,12 @@ def v10_capabilities():
         "rollback_requires_confirmation": True,
         "openai_outage_user_friendly_handling": True,
         "openai_admin_incident_alert": True,
+        "dynamic_tool_loop_guard": True,
+        "duplicate_tool_call_guard": True,
+        "forced_final_answer_after_tool_limit": True,
+        "max_dynamic_tool_rounds": MAX_DYNAMIC_TOOL_ROUNDS,
+        "max_dynamic_tool_calls_per_request": MAX_DYNAMIC_TOOL_CALLS_PER_REQUEST,
+        "openai_usage_logging": True,
         "current_permissions_injected_into_ai_prompt": True,
         "meta_ads_management_check": True,
         "budget_intelligence": True,
