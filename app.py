@@ -31,8 +31,8 @@ from psycopg.rows import dict_row
 
 app = Flask(__name__)
 
-BUILD_ID = "v10.8-tool-loop-guard-token-control-2026-09-04"
-ANALYSIS_ENGINE = "meta_driven_v9_1_action_ai_v10_2"
+BUILD_ID = "v11-unit-economics-smart-routing-2026-09-05"
+ANALYSIS_ENGINE = "meta_driven_v11_cost_routed"
 OBJECTIVE_MAPPING_HARDCODED = False
 print("BOOT BUILD_ID:", BUILD_ID)
 print("BOOT ANALYSIS_ENGINE:", ANALYSIS_ENGINE)
@@ -74,30 +74,94 @@ TOKEN_ENCRYPTION_KEY = os.getenv("TOKEN_ENCRYPTION_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
 
-# O motor dinâmico pode usar um modelo mais forte sem alterar o modelo legado.
-# Para custo/qualidade, Terra é o padrão da v8; pode ser sobrescrito no Railway.
-OPENAI_ANALYSIS_MODEL = os.getenv("OPENAI_ANALYSIS_MODEL", "gpt-5.6-terra")
-OPENAI_ANALYSIS_REASONING_EFFORT = os.getenv(
-    "OPENAI_ANALYSIS_REASONING_EFFORT",
-    "medium",
-).strip().lower()
-if OPENAI_ANALYSIS_REASONING_EFFORT not in {
-    "none", "low", "medium", "high", "xhigh", "max"
-}:
-    OPENAI_ANALYSIS_REASONING_EFFORT = "medium"
+# =========================================================
+# V11 — UNIT ECONOMICS / SMART MODEL ROUTING
+# =========================================================
+# Luna atende volume, linguagem natural, wizard e operação.
+# Terra fica reservado para diagnóstico/estratégia de verdade.
+OPENAI_FAST_MODEL = os.getenv("OPENAI_FAST_MODEL", "gpt-5.6-luna")
+OPENAI_DEEP_MODEL = os.getenv(
+    "OPENAI_DEEP_MODEL",
+    os.getenv("OPENAI_ANALYSIS_MODEL", "gpt-5.6-terra"),
+)
+# Compatibilidade com healthchecks/variáveis antigas.
+OPENAI_ANALYSIS_MODEL = OPENAI_DEEP_MODEL
 
-# V10.8 — proteção contra loops de ferramentas e consumo explosivo de tokens.
-# Quatro rodadas são suficientes para o fluxo normal conta -> campanha -> conjunto/anúncio -> validação.
-# No limite, o backend força uma resposta final sem permitir nova ferramenta, em vez de falhar.
+OPENAI_FAST_REASONING_EFFORT = os.getenv(
+    "OPENAI_FAST_REASONING_EFFORT", "low"
+).strip().lower()
+OPENAI_DEEP_REASONING_EFFORT = os.getenv(
+    "OPENAI_DEEP_REASONING_EFFORT",
+    os.getenv("OPENAI_ANALYSIS_REASONING_EFFORT", "medium"),
+).strip().lower()
+_VALID_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh", "max"}
+if OPENAI_FAST_REASONING_EFFORT not in _VALID_REASONING_EFFORTS:
+    OPENAI_FAST_REASONING_EFFORT = "low"
+if OPENAI_DEEP_REASONING_EFFORT not in _VALID_REASONING_EFFORTS:
+    OPENAI_DEEP_REASONING_EFFORT = "medium"
+# Alias legado exibido no /.
+OPENAI_ANALYSIS_REASONING_EFFORT = OPENAI_DEEP_REASONING_EFFORT
+
+SMART_MODEL_ROUTING_ENABLED = os.getenv(
+    "SMART_MODEL_ROUTING_ENABLED", "true"
+).strip().lower() in {"1", "true", "yes", "sim"}
+OPENAI_USAGE_METERING_ENABLED = os.getenv(
+    "OPENAI_USAGE_METERING_ENABLED", "true"
+).strip().lower() in {"1", "true", "yes", "sim"}
+OPENAI_PROMPT_CACHE_KEY_ENABLED = os.getenv(
+    "OPENAI_PROMPT_CACHE_KEY_ENABLED", "true"
+).strip().lower() in {"1", "true", "yes", "sim"}
+
+# Memória própria: evita uma corrente infinita de previous_response_id entre mensagens.
+# A memória compacta fica no PostgreSQL; previous_response_id é usado apenas dentro
+# da MESMA solicitação para continuar tool calls.
+try:
+    CLIENT_MEMORY_RECENT_TURNS = max(4, min(int(os.getenv("CLIENT_MEMORY_RECENT_TURNS", "8")), 20))
+except ValueError:
+    CLIENT_MEMORY_RECENT_TURNS = 8
+try:
+    CLIENT_MEMORY_COMPACT_AT = max(6, min(int(os.getenv("CLIENT_MEMORY_COMPACT_AT", "10")), 30))
+except ValueError:
+    CLIENT_MEMORY_COMPACT_AT = 10
+CLIENT_MEMORY_COMPACT_AT = min(CLIENT_MEMORY_COMPACT_AT, CLIENT_MEMORY_RECENT_TURNS)
+try:
+    CLIENT_MEMORY_SUMMARY_MAX_CHARS = max(1500, min(int(os.getenv("CLIENT_MEMORY_SUMMARY_MAX_CHARS", "5000")), 12000))
+except ValueError:
+    CLIENT_MEMORY_SUMMARY_MAX_CHARS = 5000
+
+# Guardrails de tool calling. V11 usa teto por rota; estes continuam como teto absoluto.
 try:
     MAX_DYNAMIC_TOOL_ROUNDS = max(2, min(int(os.getenv("MAX_DYNAMIC_TOOL_ROUNDS", "4")), 8))
 except ValueError:
     MAX_DYNAMIC_TOOL_ROUNDS = 4
-
 try:
-    MAX_DYNAMIC_TOOL_CALLS_PER_REQUEST = max(4, min(int(os.getenv("MAX_DYNAMIC_TOOL_CALLS_PER_REQUEST", "12")), 30))
+    MAX_DYNAMIC_TOOL_CALLS_PER_REQUEST = max(4, min(int(os.getenv("MAX_DYNAMIC_TOOL_CALLS_PER_REQUEST", "10")), 24))
 except ValueError:
-    MAX_DYNAMIC_TOOL_CALLS_PER_REQUEST = 12
+    MAX_DYNAMIC_TOOL_CALLS_PER_REQUEST = 10
+
+# Preços atuais conhecidos, em USD por 1M tokens. São usados apenas para estimativa
+# operacional por cliente; a fatura oficial continua sendo a da OpenAI.
+OPENAI_MODEL_PRICING = {
+    "gpt-5.6-luna": {"input": 0.20, "cached_input": 0.02, "output": 1.20, "cache_write": 0.25},
+    "gpt-5.6-terra": {"input": 2.00, "cached_input": 0.20, "output": 12.00, "cache_write": 2.50},
+    "gpt-5.6-sol": {"input": 4.00, "cached_input": 0.40, "output": 20.00, "cache_write": 5.00},
+    "gpt-4o-transcribe": {"input": 2.50, "cached_input": 2.50, "output": 10.00, "cache_write": 2.50},
+    "gpt-4o-mini-transcribe": {"input": 1.25, "cached_input": 1.25, "output": 5.00, "cache_write": 1.25},
+}
+
+# Limites são alertas/telemetria por padrão, não bloqueiam o cliente automaticamente.
+# Assim custo não derruba uma análise importante sem você configurar isso conscientemente.
+try:
+    OPENAI_COMPANY_SOFT_BUDGET_USD = max(0.0, float(os.getenv("OPENAI_COMPANY_SOFT_BUDGET_USD", "2.50")))
+except ValueError:
+    OPENAI_COMPANY_SOFT_BUDGET_USD = 2.50
+try:
+    OPENAI_COMPANY_HARD_BUDGET_USD = max(0.0, float(os.getenv("OPENAI_COMPANY_HARD_BUDGET_USD", "0")))
+except ValueError:
+    OPENAI_COMPANY_HARD_BUDGET_USD = 0.0
+OPENAI_HARD_BUDGET_BLOCK_ENABLED = os.getenv(
+    "OPENAI_HARD_BUDGET_BLOCK_ENABLED", "false"
+).strip().lower() in {"1", "true", "yes", "sim"}
 
 # V10 — áudio e Action AI
 OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe")
@@ -540,6 +604,57 @@ def initialize_database():
                         meta_video_id TEXT,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                         UNIQUE(company_id, whatsapp_media_id)
+                    );
+                    """
+                )
+
+                # V11 — custo por cliente/requisição e memória compacta própria.
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS openai_usage_events (
+                        id BIGSERIAL PRIMARY KEY,
+                        request_id TEXT NOT NULL,
+                        company_id BIGINT REFERENCES companies(id) ON DELETE CASCADE,
+                        user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+                        operation_type TEXT NOT NULL,
+                        route TEXT,
+                        model TEXT NOT NULL,
+                        label TEXT,
+                        input_tokens BIGINT NOT NULL DEFAULT 0,
+                        cached_input_tokens BIGINT NOT NULL DEFAULT 0,
+                        cache_write_tokens BIGINT NOT NULL DEFAULT 0,
+                        output_tokens BIGINT NOT NULL DEFAULT 0,
+                        reasoning_tokens BIGINT NOT NULL DEFAULT 0,
+                        total_tokens BIGINT NOT NULL DEFAULT 0,
+                        tool_calls INTEGER NOT NULL DEFAULT 0,
+                        estimated_cost_usd DOUBLE PRECISION,
+                        metadata JSONB,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_openai_usage_company_created
+                    ON openai_usage_events(company_id, created_at DESC);
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_openai_usage_request
+                    ON openai_usage_events(request_id, created_at ASC);
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ai_client_memory (
+                        user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                        company_id BIGINT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+                        summary_text TEXT NOT NULL DEFAULT '',
+                        recent_turns JSONB NOT NULL DEFAULT '[]'::jsonb,
+                        total_turns BIGINT NOT NULL DEFAULT 0,
+                        last_compacted_at TIMESTAMPTZ,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
                     """
                 )
@@ -1028,6 +1143,541 @@ def list_clients():
             return cursor.fetchall()
 
 
+
+# =========================================================
+# V11 — UNIT ECONOMICS / MEMÓRIA / ROTEAMENTO
+# =========================================================
+
+def _usage_detail(obj, *names, default=0):
+    current = obj
+    for name in names:
+        if current is None:
+            return default
+        if isinstance(current, dict):
+            current = current.get(name)
+        else:
+            current = getattr(current, name, None)
+    try:
+        return int(current or 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def estimate_openai_cost_usd(model, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens):
+    pricing = OPENAI_MODEL_PRICING.get(str(model or "").lower())
+    if not pricing:
+        return None
+    input_tokens = max(0, int(input_tokens or 0))
+    cached_input_tokens = max(0, min(input_tokens, int(cached_input_tokens or 0)))
+    cache_write_tokens = max(0, int(cache_write_tokens or 0))
+    # Cache-write pode aparecer como detalhe separado. Para não contar o mesmo token duas vezes,
+    # descontamos cached e cache_write da faixa uncached quando couber.
+    uncached = max(0, input_tokens - cached_input_tokens - min(cache_write_tokens, input_tokens - cached_input_tokens))
+    cost = (
+        uncached * pricing["input"]
+        + cached_input_tokens * pricing["cached_input"]
+        + cache_write_tokens * pricing["cache_write"]
+        + max(0, int(output_tokens or 0)) * pricing["output"]
+    ) / 1_000_000.0
+    return round(cost, 8)
+
+
+def record_openai_usage(context, response, request_id, operation_type, route, model, label, tool_calls=0, metadata=None):
+    if not OPENAI_USAGE_METERING_ENABLED or not response or not context:
+        return None
+    try:
+        usage = getattr(response, "usage", None)
+        if not usage:
+            return None
+        input_tokens = _usage_detail(usage, "input_tokens")
+        cached_input_tokens = _usage_detail(usage, "input_tokens_details", "cached_tokens")
+        cache_write_tokens = _usage_detail(usage, "input_tokens_details", "cache_write_tokens")
+        output_tokens = _usage_detail(usage, "output_tokens")
+        reasoning_tokens = _usage_detail(usage, "output_tokens_details", "reasoning_tokens")
+        total_tokens = _usage_detail(usage, "total_tokens", default=input_tokens + output_tokens)
+        estimated_cost = estimate_openai_cost_usd(
+            model, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens
+        )
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO openai_usage_events (
+                        request_id, company_id, user_id, operation_type, route, model, label,
+                        input_tokens, cached_input_tokens, cache_write_tokens, output_tokens,
+                        reasoning_tokens, total_tokens, tool_calls, estimated_cost_usd, metadata
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                    RETURNING id;
+                    """,
+                    (
+                        str(request_id), context.get("company_id"), context.get("user_id"),
+                        str(operation_type or route or "unknown"), str(route or "unknown"), str(model), str(label),
+                        input_tokens, cached_input_tokens, cache_write_tokens, output_tokens,
+                        reasoning_tokens, total_tokens, int(tool_calls or 0), estimated_cost,
+                        json.dumps(metadata or {}, ensure_ascii=False, default=str),
+                    ),
+                )
+                row = cursor.fetchone()
+        print("[V11] OPENAI_USAGE", {
+            "request_id": request_id, "route": route, "model": model, "label": label,
+            "input_tokens": input_tokens, "cached_input_tokens": cached_input_tokens,
+            "output_tokens": output_tokens, "estimated_cost_usd": estimated_cost,
+        })
+        return row["id"] if row else None
+    except Exception as error:
+        print("[V11] OPENAI_USAGE_RECORD_ERROR", repr(error))
+        return None
+
+
+def current_month_ai_cost(company_id):
+    if not company_id:
+        return 0.0
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT COALESCE(SUM(estimated_cost_usd), 0) AS cost
+                FROM openai_usage_events
+                WHERE company_id=%s
+                  AND created_at >= date_trunc('month', NOW());
+                """,
+                (company_id,),
+            )
+            row = cursor.fetchone() or {}
+    return float(row.get("cost") or 0.0)
+
+
+def resolve_user_by_phone(whatsapp_number):
+    exact = normalize_phone_number(whatsapp_number)
+    candidates = phone_lookup_candidates(exact)
+    if not candidates:
+        return None, "Número inválido."
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, company_id, whatsapp_number, active
+                FROM users
+                WHERE whatsapp_number = ANY(%s)
+                ORDER BY CASE WHEN whatsapp_number=%s THEN 0 ELSE 1 END, id ASC;
+                """,
+                (candidates, exact),
+            )
+            rows = cursor.fetchall()
+    if not rows:
+        return None, "Cliente não encontrado."
+    exact_rows = [r for r in rows if r.get("whatsapp_number") == exact]
+    if exact_rows:
+        return dict(exact_rows[0]), None
+    unique_ids = {r["id"] for r in rows}
+    if len(unique_ids) > 1:
+        return None, "Há mais de um cadastro compatível com esse número; use o WhatsApp exatamente como aparece em listar clientes."
+    return dict(rows[0]), None
+
+
+def get_ai_cost_summary(company_id=None, user_id=None):
+    clauses = ["created_at >= date_trunc('month', NOW())"]
+    params = []
+    if company_id is not None:
+        clauses.append("company_id=%s")
+        params.append(company_id)
+    if user_id is not None:
+        clauses.append("user_id=%s")
+        params.append(user_id)
+    where = " AND ".join(clauses)
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT
+                    COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(cached_input_tokens), 0) AS cached_input_tokens,
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                    COUNT(*) AS api_calls
+                FROM openai_usage_events
+                WHERE {where};
+                """,
+                params,
+            )
+            total = dict(cursor.fetchone() or {})
+            cursor.execute(
+                f"""
+                SELECT operation_type, model,
+                       COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                       COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                       COALESCE(SUM(cached_input_tokens), 0) AS cached_input_tokens,
+                       COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                       COUNT(*) AS api_calls
+                FROM openai_usage_events
+                WHERE {where}
+                GROUP BY operation_type, model
+                ORDER BY estimated_cost_usd DESC NULLS LAST;
+                """,
+                params,
+            )
+            breakdown = [dict(row) for row in cursor.fetchall()]
+    total["estimated_cost_usd"] = float(total.get("estimated_cost_usd") or 0.0)
+    return {"total": total, "breakdown": breakdown}
+
+
+def get_all_company_ai_costs():
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT c.id AS company_id, c.name AS company_name,
+                       COALESCE(SUM(u.estimated_cost_usd), 0) AS estimated_cost_usd,
+                       COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
+                       COALESCE(SUM(u.cached_input_tokens), 0) AS cached_input_tokens,
+                       COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
+                       COUNT(u.id) AS api_calls
+                FROM companies c
+                LEFT JOIN openai_usage_events u
+                  ON u.company_id=c.id
+                 AND u.created_at >= date_trunc('month', NOW())
+                WHERE c.active=TRUE
+                GROUP BY c.id, c.name
+                ORDER BY estimated_cost_usd DESC, c.id ASC;
+                """
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+
+def format_ai_cost_summary(summary, title="CUSTO IA — MÊS ATUAL"):
+    total = summary.get("total") or {}
+    lines = [
+        f"💵 {title}\n",
+        f"Estimativa: US$ {float(total.get('estimated_cost_usd') or 0):.4f}",
+        f"Chamadas API: {int(total.get('api_calls') or 0)}",
+        f"Input: {int(total.get('input_tokens') or 0):,}".replace(",", "."),
+        f"Input em cache: {int(total.get('cached_input_tokens') or 0):,}".replace(",", "."),
+        f"Output: {int(total.get('output_tokens') or 0):,}".replace(",", "."),
+    ]
+    breakdown = summary.get("breakdown") or []
+    if breakdown:
+        lines.append("\nPOR TIPO")
+        for row in breakdown[:10]:
+            lines.append(
+                f"• {row.get('operation_type')} / {row.get('model')}: "
+                f"US$ {float(row.get('estimated_cost_usd') or 0):.4f} "
+                f"({int(row.get('api_calls') or 0)} chamadas)"
+            )
+    lines.append("\nObservação: valor estimado pelo backend; a cobrança oficial é a da OpenAI.")
+    return "\n".join(lines)
+
+
+def get_ai_client_memory(context):
+    if not context:
+        return {"summary_text": "", "recent_turns": [], "total_turns": 0}
+    initialize_database()
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT summary_text, recent_turns, total_turns, updated_at
+                FROM ai_client_memory
+                WHERE user_id=%s;
+                """,
+                (context["user_id"],),
+            )
+            row = cursor.fetchone()
+    if not row:
+        return {"summary_text": "", "recent_turns": [], "total_turns": 0}
+    result = dict(row)
+    result["recent_turns"] = list(result.get("recent_turns") or [])
+    return result
+
+
+def append_ai_client_memory_turn(context, user_text, assistant_text, route):
+    memory = get_ai_client_memory(context)
+    recent = list(memory.get("recent_turns") or [])
+    recent.append({
+        "user": str(user_text or "")[:1200],
+        "assistant": str(assistant_text or "")[:1800],
+        "route": str(route or "general"),
+        "at": datetime.now(timezone.utc).isoformat(),
+    })
+    recent = recent[-CLIENT_MEMORY_RECENT_TURNS:]
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO ai_client_memory (user_id, company_id, summary_text, recent_turns, total_turns, updated_at)
+                VALUES (%s,%s,%s,%s::jsonb,1,NOW())
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                    company_id=EXCLUDED.company_id,
+                    recent_turns=EXCLUDED.recent_turns,
+                    total_turns=ai_client_memory.total_turns + 1,
+                    updated_at=NOW();
+                """,
+                (
+                    context["user_id"], context["company_id"], memory.get("summary_text") or "",
+                    json.dumps(recent, ensure_ascii=False, default=str),
+                ),
+            )
+    return get_ai_client_memory(context)
+
+
+_memory_compaction_lock = threading.Lock()
+_memory_compaction_users = set()
+
+
+def maybe_compact_ai_client_memory(context):
+    """Compacta memória com Luna somente quando o bloco recente fica cheio."""
+    if not OPENAI_API_KEY or not context:
+        return
+    memory = get_ai_client_memory(context)
+    recent = list(memory.get("recent_turns") or [])
+    if len(recent) < CLIENT_MEMORY_COMPACT_AT:
+        return
+    user_id = context["user_id"]
+    with _memory_compaction_lock:
+        if user_id in _memory_compaction_users:
+            return
+        _memory_compaction_users.add(user_id)
+    try:
+        request_id = "memory-" + uuid.uuid4().hex
+        static_instructions = (
+            "Comprima memória de um cliente de Meta Ads. Preserve apenas fatos duráveis, decisões, preferências, "
+            "campanhas/entidades citadas, contexto necessário para follow-ups e ações relevantes. "
+            "Não invente dados. Não preserve conversa casual. Responda em texto puro, máximo 450 palavras."
+        )
+        payload = {
+            "summary_anterior": (memory.get("summary_text") or "")[-CLIENT_MEMORY_SUMMARY_MAX_CHARS:],
+            "turnos_recentes": recent,
+        }
+        kwargs = {
+            "model": OPENAI_FAST_MODEL,
+            "reasoning": {"effort": "none"},
+            "max_output_tokens": 650,
+            "instructions": static_instructions,
+            "input": json.dumps(payload, ensure_ascii=False, default=str),
+            "store": False,
+        }
+        if OPENAI_PROMPT_CACHE_KEY_ENABLED:
+            kwargs["prompt_cache_key"] = "v11-memory-compaction"
+        response = _responses_create_compat(kwargs)
+        summary = (response.output_text or "").strip()[:CLIENT_MEMORY_SUMMARY_MAX_CHARS]
+        record_openai_usage(
+            context, response, request_id, "memory_compaction", "memory", OPENAI_FAST_MODEL,
+            "memory_compaction", tool_calls=0,
+        )
+        if summary:
+            with get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE ai_client_memory
+                        SET summary_text=%s,
+                            recent_turns=%s::jsonb,
+                            last_compacted_at=NOW(),
+                            updated_at=NOW()
+                        WHERE user_id=%s;
+                        """,
+                        (summary, json.dumps(recent[-2:], ensure_ascii=False, default=str), user_id),
+                    )
+    except Exception as error:
+        print("[V11] MEMORY_COMPACTION_ERROR", repr(error))
+    finally:
+        with _memory_compaction_lock:
+            _memory_compaction_users.discard(user_id)
+
+
+def schedule_memory_compaction(context):
+    try:
+        memory = get_ai_client_memory(context)
+        if len(memory.get("recent_turns") or []) < CLIENT_MEMORY_COMPACT_AT:
+            return
+        threading.Thread(
+            target=maybe_compact_ai_client_memory,
+            args=(dict(context),),
+            daemon=True,
+            name=f"memory-compact-{context['user_id']}",
+        ).start()
+    except Exception as error:
+        print("[V11] MEMORY_COMPACTION_SCHEDULE_ERROR", repr(error))
+
+
+def classify_ai_route(text, context=None):
+    """Roteador determinístico: não gasta tokens para escolher o modelo."""
+    normalized = normalize_text(text or "")
+    wizard = (context or {}).get("_campaign_wizard")
+    if wizard or any(term in normalized for term in [
+        "criar campanha", "montar campanha", "nova campanha", "campanha nova",
+        "criativo da campanha", "publico da campanha", "público da campanha",
+    ]):
+        return "wizard"
+
+    deep_terms = [
+        "analise", "análise", "diagnost", "gargalo", "estrateg", "por que", "o que acha", "avali",
+        "porque pior", "o que voce faria", "o que você faria", "aprofund",
+        "compare", "comparar", "comparativo", "conta inteira", "performance",
+        "desempenho", "merece atencao", "merece atenção", "otimizar", "escalar",
+        "esta boa", "está boa", "estao boas", "estão boas", "como estao", "como estão",
+    ]
+    if len(normalized) > 1000:
+        return "deep"
+    if len(normalized) > 450 and any(term in normalized for term in ["campanha", "anuncio", "anúncio", "meta", "resultado", "venda", "lead"]):
+        return "analysis"
+    if any(term in normalized for term in deep_terms):
+        if any(term in normalized for term in ["profunda", "profundo", "conta inteira", "completo", "detalhado", "estrateg"]):
+            return "deep"
+        return "analysis"
+
+    operational_terms = [
+        "paus", "reativ", "ativar", "reduz", "diminu", "aument", "alterar",
+        "mudar", "ajust", "orcamento", "orçamento", "verba", "duplic",
+        "criar pixel", "pixel", "publico", "público", "posicionamento", "evento",
+    ]
+    if any(term in normalized for term in operational_terms):
+        return "operational"
+
+    return "simple"
+
+
+def ai_route_config(route):
+    route = route or "simple"
+    if route == "deep":
+        return {"model": OPENAI_DEEP_MODEL, "reasoning": OPENAI_DEEP_REASONING_EFFORT, "max_output": 1100, "max_rounds": 4, "max_calls": 8}
+    if route == "analysis":
+        return {"model": OPENAI_DEEP_MODEL, "reasoning": "low" if OPENAI_DEEP_REASONING_EFFORT == "medium" else OPENAI_DEEP_REASONING_EFFORT, "max_output": 900, "max_rounds": 3, "max_calls": 6}
+    if route == "wizard":
+        return {"model": OPENAI_FAST_MODEL, "reasoning": OPENAI_FAST_REASONING_EFFORT, "max_output": 650, "max_rounds": 2, "max_calls": 5}
+    if route == "operational":
+        return {"model": OPENAI_FAST_MODEL, "reasoning": OPENAI_FAST_REASONING_EFFORT, "max_output": 550, "max_rounds": 2, "max_calls": 4}
+    return {"model": OPENAI_FAST_MODEL, "reasoning": "none", "max_output": 500, "max_rounds": 2, "max_calls": 4}
+
+
+def looks_like_budget_read_request(text):
+    normalized = normalize_text(text or "")
+    if not any(term in normalized for term in ["orcamento", "orçamento", "verba"]):
+        return False
+    if any(term in normalized for term in ["reduz", "diminu", "aument", "alter", "mudar", "ajust", "por que", "analise", "análise"]):
+        return False
+    return any(term in normalized for term in ["qual", "quanto", "mostr", "ver", "atual", "diari", "configur"])
+
+
+def format_budget_backend_report(context):
+    report = query_meta_budgets(context, active_only=True, limit=60)
+    campaigns = report.get("campaigns") or []
+    currency = report.get("currency") or context.get("meta_currency") or "BRL"
+    if not campaigns:
+        return "💰 ORÇAMENTO CONFIGURADO\n\nNão encontrei campanhas ativas com orçamento disponível na conta selecionada."
+    total_daily = 0.0
+    rows = []
+    lifetime = []
+    for campaign in campaigns:
+        source = campaign.get("budget_source")
+        name = campaign.get("campaign_name") or campaign.get("campaign_id")
+        if source == "campaign":
+            b = campaign.get("campaign_budget") or {}
+            if b.get("daily_budget") not in (None, 0):
+                value = float(b["daily_budget"])
+                total_daily += value
+                rows.append((name, value, "campanha"))
+            elif b.get("lifetime_budget") not in (None, 0):
+                lifetime.append((name, float(b["lifetime_budget"])))
+        elif source == "adsets":
+            value = float(campaign.get("active_adset_daily_budget_total") or 0)
+            if value > 0:
+                total_daily += value
+                rows.append((name, value, "conjuntos"))
+            elif float(campaign.get("active_adset_lifetime_budget_total") or 0) > 0:
+                lifetime.append((name, float(campaign.get("active_adset_lifetime_budget_total") or 0)))
+    lines = ["💰 ORÇAMENTO CONFIGURADO", "", f"Total diário identificado: {currency} {total_daily:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")]
+    for name, value, source in rows[:20]:
+        value_txt = f"{currency} {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        lines.append(f"• {name}: {value_txt}/dia ({source})")
+    if len(rows) > 20:
+        lines.append(f"• +{len(rows)-20} campanhas ativas")
+    if lifetime:
+        lines.append("\nORÇAMENTO VITALÍCIO")
+        for name, value in lifetime[:8]:
+            value_txt = f"{currency} {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            lines.append(f"• {name}: {value_txt}")
+    lines.append("\nOrçamento configurado é diferente de gasto realizado.")
+    return "\n".join(lines)
+
+
+def list_pending_confirmation_actions(context):
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT * FROM pending_actions
+                WHERE company_id=%s AND user_id=%s AND status='PENDING_CONFIRMATION'
+                ORDER BY created_at DESC LIMIT 10;
+                """,
+                (context["company_id"], context["user_id"]),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+
+def try_native_standard_confirmation(context, original_text):
+    if not is_explicit_confirmation_text(original_text):
+        return None
+    actions = [a for a in list_pending_confirmation_actions(context) if a.get("action_type") not in {"rollback", "rollback_action"}]
+    if not actions:
+        return None
+    if len(actions) > 1:
+        return {
+            "handled": True,
+            "message": "⚠️ EXISTE MAIS DE UMA AÇÃO PENDENTE\n\nPara sua segurança, não executei nenhuma. Envie 'ações pendentes' para escolher qual deseja confirmar.",
+        }
+    action = actions[0]
+    execution_context = dict(context)
+    execution_context["_current_user_text"] = original_text
+    result = confirm_pending_action(execution_context, action["id"])
+    if not result.get("executed"):
+        return {"handled": True, "message": f"ℹ️ {result.get('reason') or 'A ação não foi executada.'}"}
+    action_type = action.get("action_type")
+    if action_type in {"set_budget", "batch_set_budget"}:
+        changes = (result.get("result") or {}).get("changes") or []
+        lines = ["✅ ORÇAMENTO ATUALIZADO", ""]
+        for item in changes[:12]:
+            lines.append(f"• {item.get('target_name') or item.get('target_id')}: {item.get('before')} → {item.get('after')}")
+        return {"handled": True, "message": "\n".join(lines)}
+    return {"handled": True, "message": "✅ ALTERAÇÃO EXECUTADA\n\n" + str(action.get("summary") or "A Meta confirmou a operação.")}
+
+
+def _responses_create_compat(kwargs):
+    """Usa cache-key quando o SDK suporta; em SDK antigo remove somente esse campo e tenta uma vez."""
+    try:
+        return openai_client.responses.create(**kwargs)
+    except TypeError as error:
+        if "prompt_cache_key" in kwargs and ("prompt_cache_key" in str(error) or "unexpected keyword" in str(error).lower()):
+            retry = dict(kwargs)
+            retry.pop("prompt_cache_key", None)
+            return openai_client.responses.create(**retry)
+        raise
+
+
+def compact_tool_payload_for_ai(value, route="simple", depth=0):
+    """Reduz payload Meta antes de mandá-lo para a OpenAI. O dado completo continua no backend."""
+    max_depth = 6 if route in {"analysis", "deep"} else 5
+    max_items = 12 if route == "deep" else 8 if route == "analysis" else 5
+    max_string = 900 if route in {"analysis", "deep"} else 500
+    if depth > max_depth:
+        return "[conteúdo omitido por economia de contexto]"
+    if isinstance(value, dict):
+        compact = {}
+        for key, item in value.items():
+            if key in {"interpretation_contract", "meta_fields_used", "campaign_fields_used", "adset_fields_used"} and route not in {"analysis", "deep"}:
+                continue
+            compact[key] = compact_tool_payload_for_ai(item, route, depth + 1)
+        return compact
+    if isinstance(value, list):
+        items = value[:max_items]
+        compact = [compact_tool_payload_for_ai(item, route, depth + 1) for item in items]
+        if len(value) > max_items:
+            compact.append({"_truncated": len(value) - max_items})
+        return compact
+    if isinstance(value, str) and len(value) > max_string:
+        return value[:max_string] + "…"
+    return value
+
 # =========================================================
 # OAUTH META — STATE
 # =========================================================
@@ -1468,8 +2118,12 @@ def home():
         "dynamic_analysis": "enabled",
         "analysis_engine": ANALYSIS_ENGINE,
         "objective_aware": "meta_driven",
-        "analysis_model": OPENAI_ANALYSIS_MODEL,
-        "analysis_reasoning_effort": OPENAI_ANALYSIS_REASONING_EFFORT,
+        "analysis_model": OPENAI_DEEP_MODEL,
+        "analysis_reasoning_effort": OPENAI_DEEP_REASONING_EFFORT,
+        "fast_model": OPENAI_FAST_MODEL,
+        "smart_model_routing": SMART_MODEL_ROUTING_ENABLED,
+        "usage_metering": OPENAI_USAGE_METERING_ENABLED,
+        "memory_mode": "postgres_compact",
         "action_ai": "enabled" if ACTION_AI_ENABLED else "disabled",
         "audio_input": "enabled",
         "image_video_input": "enabled",
@@ -2469,7 +3123,7 @@ def audio_filename_for_mime(mime_type):
     return "whatsapp_audio" + mapping.get(mime_type, mimetypes.guess_extension(mime_type) or ".ogg")
 
 
-def transcribe_whatsapp_audio(media_id):
+def transcribe_whatsapp_audio(media_id, context=None, request_id=None):
     media = retrieve_whatsapp_media(media_id)
     file_obj = io.BytesIO(media["content"])
     file_obj.name = audio_filename_for_mime(media.get("mime_type"))
@@ -2482,6 +3136,12 @@ def transcribe_whatsapp_audio(media_id):
         file=file_obj,
         language="pt",
     )
+    if context:
+        record_openai_usage(
+            context, transcript, request_id or uuid.uuid4().hex, "audio_transcription", "audio",
+            OPENAI_TRANSCRIBE_MODEL, "audio_transcription", tool_calls=0,
+            metadata={"file_size": media.get("file_size"), "mime_type": media.get("mime_type")},
+        )
     text = getattr(transcript, "text", None)
     if not text and isinstance(transcript, dict):
         text = transcript.get("text")
@@ -2494,9 +3154,11 @@ def transcribe_whatsapp_audio(media_id):
 
 def process_audio_message(sender, user_id, media_id, progress=None):
     progress = progress or start_request_progress(sender)
+    request_id = uuid.uuid4().hex
     try:
-        transcript = transcribe_whatsapp_audio(media_id)
-        process_dynamic_analysis(sender, user_id, transcript, progress=progress)
+        context = get_user_context(sender)
+        transcript = transcribe_whatsapp_audio(media_id, context=context, request_id=request_id)
+        process_dynamic_analysis(sender, user_id, transcript, progress=progress, request_id=request_id)
     except Exception as error:
         print("[V10.2] AUDIO_PROCESS_ERROR", repr(error))
         traceback.print_exc()
@@ -3387,26 +4049,56 @@ def compare_meta_periods(
 
 
 
-def create_dynamic_openai_response(context, user_question, previous_response_id=None):
+def _tool_name(tool):
+    return str(tool.get("name") or "") if isinstance(tool, dict) else ""
+
+
+def select_tools_for_route(route):
+    analysis_names = {"consultar_insights", "comparar_periodos", "listar_estrutura_meta", "validar_resultado_meta"}
+    operational_names = {
+        "propor_acao_meta", "confirmar_acao_pendente", "cancelar_acao_pendente", "listar_acoes_pendentes",
+        "preparar_rollback_ultima_acao", "consultar_orcamentos", "propor_alteracao_orcamento",
+        "diagnosticar_permissoes_meta", "consultar_revisao_anuncios", "listar_estrutura_meta", "listar_pixels",
+    }
+    wizard_names = {
+        "iniciar_wizard_campanha", "atualizar_wizard_campanha", "consultar_wizard_campanha",
+        "editar_wizard_campanha", "cancelar_wizard_campanha", "listar_paginas_meta",
+        "buscar_localizacoes_meta", "buscar_interesses_meta", "preparar_confirmacao_wizard",
+        "criar_campanha_do_wizard", "listar_pixels", "diagnosticar_permissoes_meta",
+    }
+    simple_names = {"consultar_insights", "listar_estrutura_meta", "consultar_orcamentos", "consultar_revisao_anuncios"}
+    if route == "wizard":
+        allowed = wizard_names
+    elif route == "operational":
+        allowed = operational_names
+    elif route in {"analysis", "deep"}:
+        # Análises continuam capazes de preparar uma ação recomendada, mas não carregam o wizard inteiro.
+        allowed = analysis_names | {"consultar_orcamentos", "propor_alteracao_orcamento", "propor_acao_meta", "diagnosticar_permissoes_meta"}
+    else:
+        allowed = simple_names
+    return [tool for tool in DYNAMIC_ANALYSIS_TOOLS if _tool_name(tool) in allowed]
+
+
+def create_dynamic_openai_response(context, user_question, route, request_id):
+    cfg = ai_route_config(route)
+    tools = select_tools_for_route(route)
     kwargs = {
-        "model": OPENAI_ANALYSIS_MODEL,
-        "reasoning": {"effort": OPENAI_ANALYSIS_REASONING_EFFORT},
-        "max_output_tokens": 1200,
-        "instructions": build_dynamic_instructions(context),
-        "tools": DYNAMIC_ANALYSIS_TOOLS,
-        "tool_choice": "auto",
+        "model": cfg["model"],
+        "reasoning": {"effort": cfg["reasoning"]},
+        "max_output_tokens": cfg["max_output"],
+        "instructions": build_dynamic_instructions(context, route=route),
+        "tools": tools,
+        "tool_choice": "auto" if tools else "none",
         "parallel_tool_calls": False,
         "store": True,
         "input": user_question,
     }
-    if previous_response_id:
-        kwargs["previous_response_id"] = previous_response_id
-
-    return openai_client.responses.create(**kwargs)
+    if OPENAI_PROMPT_CACHE_KEY_ENABLED:
+        kwargs["prompt_cache_key"] = f"v11-{route}-{cfg['model']}"[:64]
+    return _responses_create_compat(kwargs), cfg, tools
 
 
 def _dynamic_tool_signature(call):
-    """Assinatura estável para detectar a mesma ferramenta com os mesmos argumentos no mesmo pedido."""
     try:
         parsed = json.loads(call.arguments or "{}")
         args_key = json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
@@ -3415,215 +4107,122 @@ def _dynamic_tool_signature(call):
     return f"{getattr(call, 'name', '')}|{args_key}"
 
 
-def _log_dynamic_openai_usage(response, label):
-    """Loga apenas contadores de tokens; não registra prompt, resposta nem segredos."""
-    try:
-        usage = getattr(response, "usage", None)
-        if not usage:
-            return
-        print(
-            "[DYNAMIC] OPENAI_USAGE",
-            {
-                "label": label,
-                "input_tokens": getattr(usage, "input_tokens", None),
-                "output_tokens": getattr(usage, "output_tokens", None),
-                "total_tokens": getattr(usage, "total_tokens", None),
-            },
-        )
-    except Exception as usage_error:
-        print("[DYNAMIC] OPENAI_USAGE_LOG_ERROR", repr(usage_error))
-
-
-def _continue_dynamic_openai_response(context, previous_response_id, tool_outputs, force_final=False):
+def _continue_dynamic_openai_response(context, previous_response_id, tool_outputs, route, cfg, force_final=False):
+    tools = select_tools_for_route(route)
     kwargs = {
-        "model": OPENAI_ANALYSIS_MODEL,
-        "reasoning": {"effort": OPENAI_ANALYSIS_REASONING_EFFORT},
-        "max_output_tokens": 1200,
-        "instructions": build_dynamic_instructions(context),
-        "tools": DYNAMIC_ANALYSIS_TOOLS,
-        "tool_choice": "none" if force_final else "auto",
+        "model": cfg["model"],
+        "reasoning": {"effort": cfg["reasoning"]},
+        "max_output_tokens": cfg["max_output"],
+        "instructions": build_dynamic_instructions(context, route=route),
+        "tools": tools,
+        "tool_choice": "none" if force_final or not tools else "auto",
         "parallel_tool_calls": False,
         "store": True,
         "previous_response_id": previous_response_id,
         "input": tool_outputs,
     }
-    return openai_client.responses.create(**kwargs)
+    if OPENAI_PROMPT_CACHE_KEY_ENABLED:
+        kwargs["prompt_cache_key"] = f"v11-{route}-{cfg['model']}"[:64]
+    return _responses_create_compat(kwargs)
 
 
-def run_dynamic_openai_analysis(context, user_question):
-    state = get_ai_conversation_state(context["user_id"])
-    previous_response_id = state.get("previous_response_id") if state else None
+def run_dynamic_openai_analysis(context, user_question, route, request_id):
+    cfg = ai_route_config(route)
+    route_max_rounds = min(MAX_DYNAMIC_TOOL_ROUNDS, int(cfg["max_rounds"]))
+    route_max_calls = min(MAX_DYNAMIC_TOOL_CALLS_PER_REQUEST, int(cfg["max_calls"]))
+    print("[V11] OPENAI_FIRST_CALL", {
+        "request_id": request_id,
+        "route": route,
+        "model": cfg["model"],
+        "reasoning_effort": cfg["reasoning"],
+        "max_tool_rounds": route_max_rounds,
+        "max_tool_calls": route_max_calls,
+        "memory_mode": "postgres_compact",
+    })
 
-    print(
-        "[DYNAMIC] OPENAI_FIRST_CALL",
-        {
-            "model": OPENAI_ANALYSIS_MODEL,
-            "reasoning_effort": OPENAI_ANALYSIS_REASONING_EFFORT,
-            "has_previous_response": bool(previous_response_id),
-            "max_tool_rounds": MAX_DYNAMIC_TOOL_ROUNDS,
-            "max_tool_calls": MAX_DYNAMIC_TOOL_CALLS_PER_REQUEST,
-        },
-    )
-
-    try:
-        response = create_dynamic_openai_response(
-            context,
-            user_question,
-            previous_response_id=previous_response_id,
-        )
-    except Exception as error:
-        if previous_response_id:
-            print(
-                "[DYNAMIC] PREVIOUS_RESPONSE_FAILED_RETRY_WITHOUT_MEMORY",
-                repr(error),
-            )
-            clear_ai_conversation_state(context["user_id"])
-            response = create_dynamic_openai_response(
-                context,
-                user_question,
-                previous_response_id=None,
-            )
-        else:
-            raise
-
-    _log_dynamic_openai_usage(response, "first")
-    print(
-        "[DYNAMIC] OPENAI_FIRST_RESPONSE",
-        {
-            "response_id": response.id,
-            "output_types": [getattr(item, "type", None) for item in response.output],
-        },
-    )
+    # V11: cada nova mensagem começa uma resposta nova. A continuidade entre mensagens vem da memória
+    # compacta do PostgreSQL, não de uma corrente infinita de previous_response_id.
+    response, cfg, tools = create_dynamic_openai_response(context, user_question, route, request_id)
+    record_openai_usage(context, response, request_id, route, route, cfg["model"], "first", tool_calls=0,
+                        metadata={"tool_schema_count": len(tools)})
+    print("[V11] OPENAI_FIRST_RESPONSE", {
+        "response_id": response.id,
+        "output_types": [getattr(item, "type", None) for item in response.output],
+    })
 
     seen_tool_signatures = set()
     total_tool_calls = 0
 
-    for round_number in range(1, MAX_DYNAMIC_TOOL_ROUNDS + 1):
-        tool_calls = [
-            item for item in response.output
-            if getattr(item, "type", None) == "function_call"
-        ]
-
+    for round_number in range(1, route_max_rounds + 1):
+        tool_calls = [item for item in response.output if getattr(item, "type", None) == "function_call"]
         if not tool_calls:
             final_text = (response.output_text or "").strip()
             if not final_text:
                 raise RuntimeError("OpenAI não retornou texto final.")
-            save_ai_conversation_state(context, response.id)
-            final_text = clean_ai_text_for_whatsapp(final_text)
-            return final_text, response.id
+            save_ai_conversation_state(context, response.id)  # compatibilidade/auditoria; não é encadeado no próximo turno.
+            return clean_ai_text_for_whatsapp(final_text), response.id
 
-        print(
-            f"[DYNAMIC] TOOL_ROUND {round_number}",
-            [getattr(call, "name", None) for call in tool_calls],
-        )
-
+        print(f"[V11] TOOL_ROUND {round_number}", [getattr(call, "name", None) for call in tool_calls])
         tool_outputs = []
         repeated_call_detected = False
 
         for call in tool_calls:
             total_tool_calls += 1
             signature = _dynamic_tool_signature(call)
-
             if signature in seen_tool_signatures:
                 repeated_call_detected = True
-                print(
-                    "[DYNAMIC] DUPLICATE_TOOL_CALL_BLOCKED",
-                    {"round": round_number, "name": getattr(call, "name", None)},
-                )
                 tool_result = {
                     "ok": False,
                     "duplicate_call": True,
-                    "error": (
-                        "Esta mesma ferramenta com os mesmos argumentos já foi executada neste pedido. "
-                        "Use o resultado anterior que já está no contexto e finalize a resposta ao cliente."
-                    ),
+                    "error": "Esta chamada já foi executada neste pedido. Use o resultado anterior e finalize.",
                 }
             else:
                 seen_tool_signatures.add(signature)
                 try:
                     args = json.loads(call.arguments or "{}")
                 except json.JSONDecodeError as error:
-                    tool_result = {
-                        "ok": False,
-                        "error": f"Argumentos inválidos da ferramenta: {error}",
-                    }
+                    tool_result = {"ok": False, "error": f"Argumentos inválidos: {error}"}
                 else:
                     try:
                         result = execute_dynamic_tool(context, call.name, args)
-                        tool_result = {"ok": True, "data": result}
+                        compact_result = compact_tool_payload_for_ai(result, route=route)
+                        tool_result = {"ok": True, "data": compact_result}
                     except Exception as tool_error:
-                        print(
-                            f"[DYNAMIC] TOOL_ERROR name={call.name}",
-                            repr(tool_error),
-                        )
+                        print(f"[V11] TOOL_ERROR name={call.name}", repr(tool_error))
                         traceback.print_exc()
-                        tool_result = {
-                            "ok": False,
-                            "error": str(tool_error),
-                        }
+                        tool_result = {"ok": False, "error": str(tool_error)}
 
-            tool_outputs.append(
-                {
-                    "type": "function_call_output",
-                    "call_id": call.call_id,
-                    "output": json.dumps(
-                        tool_result,
-                        ensure_ascii=False,
-                        default=str,
-                    ),
-                }
-            )
+            tool_outputs.append({
+                "type": "function_call_output",
+                "call_id": call.call_id,
+                "output": json.dumps(tool_result, ensure_ascii=False, default=str, separators=(",", ":")),
+            })
 
-        # Três gatilhos encerram a investigação e obrigam a IA a responder em linguagem natural:
-        # 1) repetiu exatamente uma ferramenta; 2) chegou ao teto de chamadas; 3) chegou à última rodada.
         force_final = (
             repeated_call_detected
-            or total_tool_calls >= MAX_DYNAMIC_TOOL_CALLS_PER_REQUEST
-            or round_number >= MAX_DYNAMIC_TOOL_ROUNDS
+            or total_tool_calls >= route_max_calls
+            or round_number >= route_max_rounds
         )
-
-        print(
-            "[DYNAMIC] OPENAI_CONTINUATION_CALL",
-            {
-                "previous_response_id": response.id,
-                "tool_outputs": len(tool_outputs),
-                "force_final": force_final,
-                "total_tool_calls": total_tool_calls,
-            },
-        )
-
         response = _continue_dynamic_openai_response(
             context,
             previous_response_id=response.id,
             tool_outputs=tool_outputs,
+            route=route,
+            cfg=cfg,
             force_final=force_final,
         )
-        _log_dynamic_openai_usage(response, f"tool_round_{round_number}")
-
-        print(
-            "[DYNAMIC] OPENAI_CONTINUATION_RESPONSE",
-            {
-                "response_id": response.id,
-                "output_types": [
-                    getattr(item, "type", None) for item in response.output
-                ],
-                "forced_final": force_final,
-            },
+        record_openai_usage(
+            context, response, request_id, route, route, cfg["model"], f"tool_round_{round_number}",
+            tool_calls=total_tool_calls, metadata={"force_final": force_final, "tool_outputs": len(tool_outputs)},
         )
 
         if force_final:
-            # tool_choice='none' impede nova chamada de ferramenta. Se ainda assim não vier texto,
-            # falhamos de forma explícita em vez de entrar em loop e consumir mais tokens.
             final_text = (response.output_text or "").strip()
             if not final_text:
-                raise RuntimeError(
-                    "A IA concluiu a coleta de dados, mas não conseguiu formular a resposta final."
-                )
+                raise RuntimeError("A IA coletou os dados, mas não conseguiu formular a resposta final.")
             save_ai_conversation_state(context, response.id)
-            final_text = clean_ai_text_for_whatsapp(final_text)
-            return final_text, response.id
+            return clean_ai_text_for_whatsapp(final_text), response.id
 
-    # Proteção defensiva: o fluxo normal retorna dentro do loop.
     raise RuntimeError("A análise atingiu o limite seguro de ferramentas sem resposta final.")
 
 
@@ -3640,114 +4239,98 @@ def release_analysis_lock(user_id):
         active_analysis_users.discard(user_id)
 
 
-def process_dynamic_analysis(sender, user_id, original_text, progress=None):
-    print(
-        "[DYNAMIC] JOB_START",
-        {"sender": sender, "user_id": user_id, "question": original_text},
-    )
-
+def process_dynamic_analysis(sender, user_id, original_text, progress=None, request_id=None):
+    request_id = request_id or uuid.uuid4().hex
+    print("[V11] JOB_START", {"request_id": request_id, "sender": sender, "user_id": user_id})
     progress = progress or start_request_progress(sender)
 
     try:
         context = get_user_context(sender)
-        print(
-            "[DYNAMIC] USER_CONTEXT_OK",
-            {
-                "company_id": context.get("company_id") if context else None,
-                "user_id": context.get("user_id") if context else None,
-                "ad_account_id": context.get("ad_account_id") if context else None,
-            },
-        )
-
         if not context:
             send_whatsapp_message(sender, "⛔ Este número ainda não está cadastrado no sistema.")
             return
 
         context = dict(context)
         context["_current_user_text"] = original_text
-
         if not context.get("can_read_ads"):
             send_whatsapp_message(sender, "⛔ Você não possui permissão para consultar Meta Ads.")
             return
-
         if not OPENAI_API_KEY:
             raise RuntimeError("OPENAI_API_KEY não configurada.")
 
-        # Injeta no prompt o estado persistente do wizard, quando existir.
         if CAMPAIGN_WIZARD_ENABLED:
             try:
                 context["_campaign_wizard"] = get_active_campaign_wizard(context)
             except Exception as wizard_error:
-                print("[V10.2] WIZARD_CONTEXT_ERROR", repr(wizard_error))
+                print("[V11] WIZARD_CONTEXT_ERROR", repr(wizard_error))
                 context["_campaign_wizard"] = None
 
-        log_activity(
-            context,
-            "dynamic_analysis_started",
-            {"question": original_text, "build_id": BUILD_ID},
-        )
+        context["_client_memory"] = get_ai_client_memory(context)
+        route = classify_ai_route(original_text, context) if SMART_MODEL_ROUTING_ENABLED else "deep"
+        cfg = ai_route_config(route)
+        month_cost = current_month_ai_cost(context.get("company_id")) if OPENAI_USAGE_METERING_ENABLED else 0.0
 
-        answer, response_id = run_dynamic_openai_analysis(context, original_text)
+        if (
+            OPENAI_HARD_BUDGET_BLOCK_ENABLED
+            and OPENAI_COMPANY_HARD_BUDGET_USD > 0
+            and month_cost >= OPENAI_COMPANY_HARD_BUDGET_USD
+        ):
+            raise RuntimeError("Limite mensal interno de custo IA atingido para esta empresa.")
 
-        print(
-            "[DYNAMIC] FINAL_ANSWER_READY",
-            {"response_id": response_id, "chars": len(answer)},
-        )
+        log_activity(context, "dynamic_analysis_started", {
+            "question": original_text,
+            "build_id": BUILD_ID,
+            "request_id": request_id,
+            "route": route,
+            "model": cfg["model"],
+            "month_estimated_cost_usd": month_cost,
+        })
+        print("[V11] ROUTE", {"request_id": request_id, "route": route, "model": cfg["model"], "month_cost": month_cost})
 
-        log_activity(
-            context,
-            "dynamic_analysis_completed",
-            {
-                "question": original_text,
-                "response_id": response_id,
-                "build_id": BUILD_ID,
-            },
-        )
-
+        answer, response_id = run_dynamic_openai_analysis(context, original_text, route, request_id)
         formatted_answer = clean_ai_text_for_whatsapp(answer)
-        print(
-            "[DYNAMIC] FORMAT_CHECK",
-            {
-                "contains_hash": "#" in formatted_answer,
-                "contains_asterisk": "*" in formatted_answer,
-                "chars": len(formatted_answer),
-            },
-        )
+
+        append_ai_client_memory_turn(context, original_text, formatted_answer, route)
+        schedule_memory_compaction(context)
+
+        log_activity(context, "dynamic_analysis_completed", {
+            "question": original_text,
+            "response_id": response_id,
+            "build_id": BUILD_ID,
+            "request_id": request_id,
+            "route": route,
+            "model": cfg["model"],
+        })
         progress.stop()
         send_whatsapp_long_message(sender, formatted_answer)
-        print("[DYNAMIC] JOB_DONE")
+        print("[V11] JOB_DONE", {"request_id": request_id, "route": route})
 
     except Exception as error:
-        print("[DYNAMIC] JOB_ERROR:", repr(error))
+        print("[V11] JOB_ERROR", {"request_id": request_id, "error": repr(error)})
         traceback.print_exc()
-
         try:
             context = get_user_context(sender)
-            log_activity(
-                context,
-                "dynamic_analysis_failed",
-                {
-                    "question": original_text,
-                    "error": repr(error),
-                    "build_id": BUILD_ID,
-                },
-            )
+            log_activity(context, "dynamic_analysis_failed", {
+                "question": original_text,
+                "error": repr(error),
+                "build_id": BUILD_ID,
+                "request_id": request_id,
+            })
         except Exception:
             traceback.print_exc()
-
         progress.stop()
         send_whatsapp_message(sender, build_user_friendly_error(error, stage="análise no Meta Ads"))
     finally:
         progress.stop()
         release_analysis_lock(user_id)
-        print("[DYNAMIC] JOB_RELEASED", {"user_id": user_id})
+        print("[V11] JOB_RELEASED", {"request_id": request_id, "user_id": user_id})
 
 
 # =========================================================
 # OPENAI — ANÁLISE LEGADA DE 7 DIAS
 # =========================================================
 
-def analyze_meta_report(report, user_question):
+def analyze_meta_report(report, user_question, context=None, request_id=None):
     dados = f"""
 PERÍODO:
 Últimos 7 dias
@@ -3801,6 +4384,11 @@ DADOS:
 """,
     )
 
+    if context:
+        record_openai_usage(
+            context, response, request_id or uuid.uuid4().hex, "legacy_analysis_7d", "legacy",
+            OPENAI_MODEL, "legacy_analysis", tool_calls=0,
+        )
     return clean_ai_text_for_whatsapp(response.output_text)
 
 
@@ -4379,7 +4967,7 @@ def receive_webhook():
             send_whatsapp_message(sender, "Analisando os dados...")
 
             try:
-                analysis = analyze_meta_report(report, original_text)
+                analysis = analyze_meta_report(report, original_text, context=context, request_id=uuid.uuid4().hex)
                 log_activity(context, "ai_analysis_7_days")
                 send_whatsapp_message(sender, analysis)
             except Exception as error:
@@ -4464,9 +5052,57 @@ def receive_webhook():
                 send_whatsapp_message(sender, "ℹ️ Não havia um rollback pendente para cancelar.")
             return "EVENT_RECEIVED", 200
 
+        # =================================================
+        # V11 — ROTAS ZERO/BAIXO TOKEN ANTES DA OPENAI
+        # =================================================
+
+        if context.get("is_platform_admin") and received_text == "custos ia":
+            companies = get_all_company_ai_costs()
+            lines = ["💵 CUSTO IA — MÊS ATUAL\n"]
+            total = 0.0
+            for company in companies[:25]:
+                cost = float(company.get("estimated_cost_usd") or 0.0)
+                total += cost
+                lines.append(f"• {company.get('company_name')}: US$ {cost:.4f} ({int(company.get('api_calls') or 0)} chamadas)")
+            lines.insert(1, f"Total estimado: US$ {total:.4f}\n")
+            lines.append("\nUse: custos ia cliente | NUMERO")
+            send_whatsapp_message(sender, "\n".join(lines))
+            return "EVENT_RECEIVED", 200
+
+        if context.get("is_platform_admin") and received_text.startswith("custos ia cliente"):
+            parts = [item.strip() for item in original_text.split("|")]
+            if len(parts) != 2:
+                send_whatsapp_message(sender, "Use: custos ia cliente | 5531999999999")
+                return "EVENT_RECEIVED", 200
+            matched, error = resolve_user_by_phone(parts[1])
+            if error or not matched:
+                send_whatsapp_message(sender, f"❌ {error or 'Cliente não encontrado.'}")
+                return "EVENT_RECEIVED", 200
+            summary = get_ai_cost_summary(company_id=matched["company_id"], user_id=matched["id"])
+            send_whatsapp_message(sender, format_ai_cost_summary(summary, title=f"CUSTO IA — {matched['whatsapp_number']}"))
+            return "EVENT_RECEIVED", 200
+
+        if looks_like_budget_read_request(original_text):
+            try:
+                send_whatsapp_message(sender, format_budget_backend_report(dict(context)))
+                log_activity(context, "native_budget_read", {"build_id": BUILD_ID})
+            except Exception as error:
+                send_whatsapp_message(sender, build_user_friendly_error(error, stage="consulta de orçamento"))
+            return "EVENT_RECEIVED", 200
+
+        try:
+            native_confirmation = try_native_standard_confirmation(dict(context), original_text)
+        except Exception as error:
+            print("[V11] NATIVE_CONFIRMATION_ERROR", repr(error))
+            send_whatsapp_message(sender, build_user_friendly_error(error, stage="confirmação da alteração"))
+            return "EVENT_RECEIVED", 200
+        if native_confirmation and native_confirmation.get("handled"):
+            send_whatsapp_message(sender, native_confirmation.get("message") or "✅ Solicitação processada.")
+            return "EVENT_RECEIVED", 200
+
         print(
-            "[DYNAMIC] ROUTING_TO_AI",
-            {"build_id": BUILD_ID, "sender": sender, "text": original_text},
+            "[V11] ROUTING_TO_AI",
+            {"build_id": BUILD_ID, "sender": sender, "route": classify_ai_route(original_text, dict(context))},
         )
 
         if not acquire_analysis_lock(context["user_id"]):
@@ -5896,15 +6532,24 @@ def propose_budget_change(context, mode, amount_major, campaign_ids=None, search
 
 
 def is_explicit_confirmation_text(text):
-    n = normalize_text(text or "")
-    negative = ["nao", "não", "cancela", "cancelar", "deixa", "nao faca", "não faça"]
-    if any(term in n for term in negative):
+    # Confirmação é intencionalmente estrita. Não use substring de "sim"/"pode",
+    # pois frases como "pode me dizer..." não são autorização de escrita.
+    n = re.sub(r"[.!?]+$", "", normalize_text(text or "").strip())
+    if not n:
         return False
-    confirmations = [
-        "sim", "confirmo", "confirmar", "pode fazer", "pode executar", "faca", "faça",
-        "faz isso", "execute", "pode ativar", "ativa", "ative", "manda bala", "pode",
-    ]
-    return any(term in n for term in confirmations)
+    negative_terms = {
+        "nao", "cancela", "cancelar", "deixa", "nao faca", "nao faz",
+        "nao execute", "nao ativa", "nao ativar",
+    }
+    if n in negative_terms or n.startswith("nao "):
+        return False
+    exact_confirmations = {
+        "sim", "confirmo", "confirmar", "pode", "pode fazer", "pode executar",
+        "faca", "faz isso", "execute", "pode ativar", "ativa", "ative",
+        "manda bala", "sim pode", "sim pode fazer", "sim pode executar",
+        "sim faca", "sim execute", "confirmado",
+    }
+    return n in exact_confirmations
 
 
 def is_explicit_creation_request(text):
@@ -8003,175 +8648,88 @@ DYNAMIC_ANALYSIS_TOOLS = [
 DYNAMIC_ANALYSIS_TOOLS.extend(ACTION_AI_TOOLS)
 
 
-def build_dynamic_instructions(context):
+V11_STATIC_CORE_INSTRUCTIONS = """
+Você é um GESTOR DE TRÁFEGO IA operando Meta Ads por WhatsApp em um SaaS multiempresa.
+O cliente é leigo. Traduza intenção em análise/ação sem exigir IDs ou termos técnicos.
+
+REGRAS GERAIS
+- A Meta é a fonte da verdade para objetivo, setup, orçamento e status.
+- Nunca invente números, IDs, resultados, público, orçamento, evento ou configuração.
+- Não deduza objetivo pelo nome da campanha e não trate Resultado como sinônimo de lead.
+- Backend valida propriedade, permissão, payload e confirmação; a IA interpreta e recomenda.
+- Toda mudança em estrutura existente exige confirmação explícita antes da execução.
+- Estruturas novas criadas pelo wizard nascem PAUSED e exigem confirmação separada para ativar.
+- Permissões atuais fornecidas no final deste prompt prevalecem sobre qualquer afirmação antiga da conversa.
+- Responda em português do Brasil, texto puro, sem Markdown, tabelas ou parede de texto.
+- Use no máximo 3 a 5 blocos, títulos curtos com um emoji, bullets quando necessário.
+- Separe fato, leitura e hipótese. Comece pela conclusão.
+""".strip()
+
+V11_ROUTE_INSTRUCTIONS = {
+    "simple": """
+ROTA: CONSULTA SIMPLES
+Use o mínimo de ferramentas. Responda objetivamente. Para dados reais da conta, consulte a Meta; não faça diagnóstico profundo se não foi pedido.
+""".strip(),
+    "operational": """
+ROTA: OPERAÇÃO
+Priorize ferramentas de orçamento/ação. Para alterar orçamento use propor_alteracao_orcamento. Para pausa/reativação use propor_acao_meta.
+A proposta não executa nada: explique antes/depois e peça confirmação. Não distribua redução entre vários conjuntos sem autorização clara.
+""".strip(),
+    "analysis": """
+ROTA: ANÁLISE
+Faça diagnóstico real: conclusão -> 2 a 4 evidências -> interpretação -> ação prioritária.
+Leia objective/setup real antes de escolher KPI. Quando escolher action_type, valide-o quando necessário.
+Aprofunde somente nas entidades que explicam a diferença; não peça uma fotografia completa da conta sem necessidade.
+""".strip(),
+    "deep": """
+ROTA: ANÁLISE PROFUNDA
+Use o modelo forte para raciocínio estratégico. Investigue conta -> campanha -> conjunto/anúncio conforme os dados exigirem.
+Procure causa principal, magnitude, evidências, hipóteses alternativas e plano de ação priorizado. Preserve rigor do setup Meta e valide o resultado pertinente.
+Se recomendar uma ação suportada, pode deixá-la pendente para confirmação, mas nunca execute sem autorização.
+""".strip(),
+    "wizard": """
+ROTA: CAMPAIGN WIZARD
+Conduza criação em blocos: objetivo/nome -> categoria especial -> orçamento/período -> público -> destino/Pixel/evento -> Página -> criativos/copy -> revisão.
+Pergunte apenas o próximo bloco necessário. Salve informações com atualizar_wizard_campanha.
+Para localização/interesse use buscas Meta; para Pixel/Página liste ativos reais. Não invente informação crítica.
+Antes de criar use preparar_confirmacao_wizard. Só crie após confirmação explícita. Tudo nasce PAUSED; ativação é outra confirmação.
+""".strip(),
+}
+
+
+def build_dynamic_instructions(context, route="simple"):
     today = get_today_for_context(context)
-    return f"""
-Você é um GESTOR DE TRÁFEGO IA operando Meta Ads por WhatsApp dentro de um SaaS multiempresa.
-Você conversa com pessoas leigas. Elas não devem precisar abrir o Gerenciador de Anúncios nem conhecer termos técnicos para tomar decisões.
+    memory = context.get("_client_memory") or {}
+    summary = str(memory.get("summary_text") or "")[-CLIENT_MEMORY_SUMMARY_MAX_CHARS:]
+    recent = list(memory.get("recent_turns") or [])[-4:]
+    wizard = context.get("_campaign_wizard")
+    if route == "wizard" and wizard:
+        wizard_context = compact_tool_payload_for_ai(wizard, route="wizard")
+    else:
+        wizard_context = {"active": bool(wizard), "status": wizard.get("status") if isinstance(wizard, dict) else None}
 
-Empresa: {context.get('company_name')}.
-Conta Meta: {context.get('ad_account_id') or 'nenhuma'}.
-Data atual na timezone da conta: {today.isoformat()}.
-Permissões internas ATUAIS deste WhatsApp: leitura={bool(context.get('can_read_ads'))}, gerenciamento={bool(context.get('can_manage_ads'))}, criação={bool(context.get('can_create_campaigns'))}.
-Estado do Campaign Wizard: {json.dumps(context.get("_campaign_wizard"), ensure_ascii=False, default=str) if context.get("_campaign_wizard") else "nenhum wizard ativo"}.
-
-REGRA DE ATUALIZAÇÃO DE PERMISSÕES E MEMÓRIA
-- Preserve o histórico e o contexto da conversa do cliente; uma mudança de permissão NÃO significa perda de memória.
-- As permissões acima são a fotografia atual do PostgreSQL para ESTE turno e prevalecem sobre qualquer afirmação antiga da conversa sobre acesso.
-- Mensagens antigas continuam válidas como contexto estratégico, mas NÃO são fonte de verdade para autorização.
-- Nunca recuse uma ação apenas porque em uma mensagem anterior o sistema disse que a permissão estava bloqueada.
-- Quando o usuário pedir orçamento, pausa, reativação ou outra alteração suportada, chame a ferramenta correspondente e deixe o backend revalidar a permissão em tempo real.
-- Para criação de campanha, o backend também revalida can_create_campaigns em tempo real.
-
-MISSÃO
-1. Entender o que o cliente quer, seja texto ou uma transcrição de áudio.
-2. Ler o setup REAL retornado pela Meta antes de avaliar performance.
-3. Analisar de verdade: conclusão -> evidência -> interpretação -> ação.
-4. Quando houver uma ação segura que o sistema consegue executar, traduzir a intenção leiga em operação Meta.
-5. Nunca inventar números, IDs, resultados, público, orçamento, evento ou configuração.
-
-REGRA CENTRAL DA V9.1 PRESERVADA
-- A Meta é a fonte da verdade sobre objetivo/setup.
-- Não existe tabela fixa objetivo -> KPI.
-- Não deduza objetivo pelo nome da campanha.
-- Não trate Resultados como sinônimo de lead.
-- Leia campaign objective e depois optimization_goal/optimization_sub_event/billing_event/promoted_object/destination_type do conjunto.
-- Use objective_results/cost_per_objective_result/cost_per_result quando disponíveis; caso contrário confronte setup com actions/cost_per_action_type.
-- Se escolher um action_type como resultado principal, valide com validar_resultado_meta.
-- Em conta com setups mistos, não invente um KPI universal.
-
-PROTOCOLO ANALÍTICO
-- Comece pela conclusão, não por uma planilha narrada.
-- Use 2 a 4 números como evidência.
-- Explique o que eles significam e qual decisão eles sustentam.
-- Separe fato, leitura e hipótese.
-- Quando necessário, aprofunde conta -> campanha -> conjunto -> anúncio.
-- Se o cliente perguntar "o que você faria?", entregue uma recomendação executável e priorizada.
-
-V10 ACTION AI — PRINCÍPIO DE SEGURANÇA
-- IA interpreta e propõe; backend valida propriedade, permissão e payload; Meta executa.
-- Nunca faça POST livre para a Meta fora das ferramentas controladas.
-- Toda alteração em uma estrutura EXISTENTE exige confirmação antes da execução.
-- Sempre que a recomendação for uma ação que a ferramenta consegue realizar, você PODE usar propor_acao_meta para deixar o plano pendente. Isso NÃO executa nada. Depois explique em linguagem simples e peça confirmação.
-- Se o cliente responder "faça", "pode fazer", "pode ativar", "confirmo" etc., use confirmar_acao_pendente. O backend ainda verifica a mensagem real antes de executar.
-- Se houver mais de uma ação pendente e a referência estiver ambígua, liste as ações e pergunte qual delas.
-- Nunca trate um "sim" fora de contexto como autorização para gasto ou alteração.
-- Se o cliente pedir para desfazer/reverter a última alteração, use preparar_rollback_ultima_acao. O rollback também exige confirmação.
-- Nunca invente o estado anterior. Se o backend disser que a ação não é reversível com segurança, explique isso.
-- O rollback nativo pode funcionar mesmo quando a OpenAI está indisponível; não diga que toda reversão depende da IA.
-
-CRIAÇÃO DE CAMPANHA — WIZARD HÍBRIDO V10.2
-- Quando o cliente disser que quer criar/montar uma campanha, use iniciar_wizard_campanha.
-- O cliente fala de forma leiga; você traduz para configuração técnica, mas nunca inventa informação crítica.
-- Salve cada informação recebida com atualizar_wizard_campanha. O wizard persiste entre mensagens e áudios.
-- Pergunte apenas UM BLOCO LÓGICO por vez. Ordem preferida: objetivo/nome -> categoria especial -> orçamento/período -> público -> destino/Pixel/evento -> Página -> criativos/copy -> revisão.
-- Para localização/interesses, use buscar_localizacoes_meta/buscar_interesses_meta em vez de inventar IDs.
-- Para Pixel e Página, use listar_pixels/listar_paginas_meta e apresente nomes simples.
-- O cliente pode enviar IMAGEM ou VÍDEO pelo WhatsApp durante o wizard; o backend fará upload controlado para a Meta e anexará o ativo ao rascunho.
-- Você pode escrever/sugerir copy, headline e CTA, mas o cliente deve conseguir revisar antes da criação.
-- Antes de criar qualquer objeto, use preparar_confirmacao_wizard e mostre o resumo.
-- Só use criar_campanha_do_wizard quando a mensagem atual confirmar explicitamente: "Pode criar" ou equivalente inequívoco.
-- Toda campaign, adset e ad criados pelo wizard nascem PAUSED.
-- Depois da criação, a ATIVAÇÃO permanece uma segunda ação pendente e exige nova confirmação.
-- Se o cliente quiser mudar algo depois do resumo, use editar_wizard_campanha, ajuste e gere novo resumo.
-- Não use criar_estrutura_pausada diretamente quando houver wizard ativo; prefira o fluxo determinístico do wizard.
-- Depois de criar a estrutura pausada, mostre uma confirmação curta com três blocos:
-
-🎯 CAMPANHA
-Objetivo/direcionamento principal.
-
-👥 CONJUNTO DE ANÚNCIOS
-Orçamento, público/segmentação, período e otimização/destino principais.
-
-🎨 ANÚNCIOS
-Quantidade, nome dos anúncios/criativos e destino/texto quando disponíveis.
-
-Depois destaque exatamente a ideia:
-⚠️ CAMPANHA PAUSADA
-Sua campanha está criada, porém pausada.
-É preciso que você confirme para que eu possa colocá-la em veiculação.
-
-- Não ative a estrutura no mesmo turno da criação. A ativação fica como ação pendente separada.
-
-ORÇAMENTO — REGRA OBRIGATÓRIA V10.3
-- Nunca use gasto de Insights como se fosse orçamento configurado.
-- Quando o cliente perguntar verba/orçamento diário, use consultar_orcamentos.
-- A Meta pode controlar orçamento na campanha OU nos conjuntos. Descubra onde está antes de responder ou alterar.
-- Se houver daily_budget, apresente como orçamento diário. Se houver apenas lifetime_budget, diga que é orçamento vitalício; não invente valor diário.
-- Para aumentar/reduzir/definir orçamento, prefira propor_alteracao_orcamento. O backend calcula o novo valor a partir da Meta e cria uma única ação pendente.
-- Se uma campanha tiver vários conjuntos controlando orçamento e o pedido não disser como distribuir, NÃO distribua por conta própria. Peça esclarecimento.
-- Antes de executar orçamento, o backend confere novamente o valor atual para evitar alteração com dado desatualizado.
-- can_manage_ads controla pausa, reativação, orçamento e ajustes. can_create_campaigns é separado e não deve bloquear uma simples gestão.
-- Se a Meta não tiver ads_management concedido ao token, explique que a conexão precisa ser reconectada depois que essa permissão estiver liberada.
-
-AÇÕES EM ESTRUTURAS EXISTENTES
-Use propor_acao_meta para:
-- pausar/reativar campanha, conjunto ou anúncio (set_status);
-- para orçamento, prefira propor_alteracao_orcamento; set_budget fica como ferramenta técnica para um alvo já identificado;
-- duplicar campanha/conjunto/anúncio, sempre com cópia PAUSED (duplicate);
-- alterar targeting, posicionamentos, otimização, evento/destino e outros campos permitidos do conjunto (update_adset);
-- criar Pixel (create_pixel).
-
-PIXEL
-- listar_pixels consulta Pixels da conta.
-- criar Pixel exige ação pendente + confirmação.
-- Criar o objeto Pixel na Meta NÃO instala o Pixel no site. Se o cliente pedir instalação, explique que será necessária uma integração com site/GTM/CAPI/WordPress ou equivalente.
-
-REVISÃO DE ANÚNCIOS
-- A ferramenta monitora anúncios criados por ela.
-- Quando o status for aprovado/ativo/preapproved, o cliente recebe mensagem de aprovação.
-- Quando for DISAPPROVED/WITH_ISSUES, recebe reprovação/problema e você pode analisar o feedback.
-- Não diga "a campanha foi aprovada" como fato técnico se o que a Meta revisou foi o anúncio. Prefira "anúncio aprovado" ou "todos os anúncios estão aptos".
-
-LINGUAGEM PARA LEIGOS
-O cliente pode falar coisas como:
-- "Minhas campanhas estão boas?"
-- "O que está errado?"
-- "O que você faria?"
-- "Então faça."
-- "Quero vender mais sem aumentar o orçamento."
-- "Arruma as campanhas ruins."
-- "Crie uma campanha para essa nova oferta."
-- "Pausa aquele anúncio."
-- "Aumenta esse orçamento para 150 por dia."
-Você deve traduzir isso para análise/ação sem exigir que ele conheça Campaign ID, AdSet ID, CTR ou nomes da API. Use IDs internamente quando necessário.
-
-PERÍODOS
-- Sem período explícito: mês atual até hoje, salvo contexto anterior.
-- "este mês x mês passado" com mês incompleto: períodos equivalentes.
-- Datas explícitas: respeite exatamente.
-- Follow-up: preserve período e entidade da conversa quando fizer sentido.
-
-FORMATO DE RESPOSTA ANALÍTICA
-- Comece com a resposta principal em 1 ou 2 frases.
-- Use no máximo 3 a 5 blocos visuais.
-- Cada bloco deve ter um título curto com UM emoji e MAIÚSCULAS.
-- Prefira bullets quando houver 2+ itens.
-- Nunca faça um parágrafo longo com vários números.
-
-🧠 DIAGNÓSTICO
-Conclusão direta em até 3 linhas.
-
-📌 EVIDÊNCIAS
-2 a 4 dados realmente necessários.
-
-🔎 O QUE ISSO SIGNIFICA
-Traduza os dados para uma decisão de negócio, sem jargão desnecessário.
-
-🎯 O QUE EU FARIA AGORA
-Uma ação concreta, priorizada e explicada em linguagem simples. Se puder ser executada, proponha a ação e peça confirmação.
-
-FORMATAÇÃO WHATSAPP
-- O cliente é leigo e lê no celular. Facilite o escaneamento.
-- Sem #, ##, **, _, crases ou tabelas Markdown.
-- Não escreva parede de texto.
-- Títulos curtos em MAIÚSCULAS com um emoji.
-- Parágrafos de no máximo 2 a 3 frases.
-- Use uma linha em branco entre blocos.
-- Use • para listas.
-- Não repita a mesma conclusão com palavras diferentes.
-- O backend fará sanitização e quebra final de parágrafos.
-"""
+    # Conteúdo estático primeiro = melhor chance de Prompt Caching.
+    # Tudo que muda por empresa/turno vai para o final.
+    dynamic = {
+        "empresa": context.get("company_name"),
+        "conta_meta": context.get("ad_account_id"),
+        "data": today.isoformat(),
+        "permissoes": {
+            "leitura": bool(context.get("can_read_ads")),
+            "gerenciamento": bool(context.get("can_manage_ads")),
+            "criacao": bool(context.get("can_create_campaigns")),
+        },
+        "memoria_resumida": summary,
+        "turnos_recentes": recent,
+        "wizard": wizard_context,
+    }
+    return (
+        V11_STATIC_CORE_INSTRUCTIONS
+        + "\n\n"
+        + V11_ROUTE_INSTRUCTIONS.get(route, V11_ROUTE_INSTRUCTIONS["simple"])
+        + "\n\nCONTEXTO DINÂMICO DESTE TURNO\n"
+        + json.dumps(dynamic, ensure_ascii=False, default=str, separators=(",", ":"))
+    )
 
 
 def execute_dynamic_tool(context, tool_name, arguments):
@@ -8419,6 +8977,31 @@ def v10_capabilities():
             "meta_pages_location_interest_lookup",
             "progress_heartbeat_every_50s_default",
         ],
+    }, 200
+
+
+@app.route("/v11-capabilities", methods=["GET"])
+def v11_capabilities():
+    return {
+        "build_id": BUILD_ID,
+        "smart_model_routing": SMART_MODEL_ROUTING_ENABLED,
+        "fast_model": OPENAI_FAST_MODEL,
+        "deep_model": OPENAI_DEEP_MODEL,
+        "deep_analysis_preserved": True,
+        "deterministic_budget_read": True,
+        "deterministic_action_confirmation": True,
+        "route_specific_tool_sets": True,
+        "tool_payload_compaction": True,
+        "prompt_static_prefix_first": True,
+        "prompt_cache_key_enabled": OPENAI_PROMPT_CACHE_KEY_ENABLED,
+        "cross_turn_previous_response_chain": False,
+        "postgres_compact_memory": True,
+        "usage_metering_per_company": True,
+        "usage_metering_per_request": True,
+        "admin_cost_commands": ["custos ia", "custos ia cliente | NUMERO"],
+        "native_rollback": True,
+        "writes_require_confirmation": True,
+        "campaign_wizard": CAMPAIGN_WIZARD_ENABLED,
     }, 200
 
 
