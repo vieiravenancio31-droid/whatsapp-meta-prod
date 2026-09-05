@@ -31,8 +31,8 @@ from psycopg.rows import dict_row
 
 app = Flask(__name__)
 
-BUILD_ID = "v11-unit-economics-smart-routing-2026-09-05"
-ANALYSIS_ENGINE = "meta_driven_v11_cost_routed"
+BUILD_ID = "v11.1-context-aware-operational-followup-2026-09-05"
+ANALYSIS_ENGINE = "meta_driven_v11_1_context_routed"
 OBJECTIVE_MAPPING_HARDCODED = False
 print("BOOT BUILD_ID:", BUILD_ID)
 print("BOOT ANALYSIS_ENGINE:", ANALYSIS_ENGINE)
@@ -1500,6 +1500,60 @@ def schedule_memory_compaction(context):
         print("[V11] MEMORY_COMPACTION_SCHEDULE_ERROR", repr(error))
 
 
+def looks_like_operational_followup(text, context=None):
+    """
+    Detecta continuação operacional curta sem usar IA.
+
+    Ex.: depois de uma análise o cliente responde "então faça", "faz isso" ou
+    "aplica essa recomendação". Essas frases não repetem palavras como orçamento/pausa,
+    mas precisam receber as ferramentas de gerenciamento da rota operational.
+
+    A detecção é deliberadamente estrita: não transforma um "sim" isolado em ação e
+    não usa substring ampla de "pode", evitando autorizações acidentais.
+    """
+    n = re.sub(r"[.!?]+$", "", normalize_text(text or "").strip())
+    if not n:
+        return False
+
+    negatives = (
+        "nao ", "nao faca", "nao faz", "nao execute", "nao aplica",
+        "cancela", "cancelar", "deixa",
+    )
+    if n.startswith(negatives) or n in {"nao", "deixa pra la", "deixa para la"}:
+        return False
+
+    exact = {
+        "faz isso", "faca isso", "entao faz", "entao faca",
+        "executa isso", "execute isso", "aplica isso", "aplique isso",
+        "pode fazer", "pode executar", "pode executar isso",
+        "pode aplicar", "pode aplicar isso", "pode seguir",
+        "faz o que voce falou", "faca o que voce falou",
+        "faz o que voce recomendou", "faca o que voce recomendou",
+        "execute a recomendacao", "executa a recomendacao",
+        "aplique a recomendacao", "aplica a recomendacao",
+        "coloca isso em pratica", "coloque isso em pratica",
+        "pode colocar em pratica", "segue com isso", "pode seguir com isso",
+    }
+    if n in exact:
+        return True
+
+    # Aceita pequenas extensões referenciais, mas não frases abertas do tipo
+    # "pode me dizer..." ou "faz uma análise...".
+    prefixes = (
+        "entao faz isso", "entao faca isso",
+        "faz essa alteracao", "faca essa alteracao",
+        "executa essa alteracao", "execute essa alteracao",
+        "aplica essa alteracao", "aplique essa alteracao",
+        "faz essa recomendacao", "faca essa recomendacao",
+        "executa essa recomendacao", "execute essa recomendacao",
+        "aplica essa recomendacao", "aplique essa recomendacao",
+    )
+    if any(n == prefix or n.startswith(prefix + " ") for prefix in prefixes):
+        return True
+
+    return False
+
+
 def classify_ai_route(text, context=None):
     """Roteador determinístico: não gasta tokens para escolher o modelo."""
     normalized = normalize_text(text or "")
@@ -1509,6 +1563,11 @@ def classify_ai_route(text, context=None):
         "criativo da campanha", "publico da campanha", "público da campanha",
     ]):
         return "wizard"
+
+    # V11.1: continuação curta de uma recomendação/ação anterior deve receber
+    # ferramentas operacionais, mesmo sem repetir "orçamento", "pausar" etc.
+    if looks_like_operational_followup(text, context):
+        return "operational"
 
     deep_terms = [
         "analise", "análise", "diagnost", "gargalo", "estrateg", "por que", "o que acha", "avali",
@@ -6545,7 +6604,16 @@ def is_explicit_confirmation_text(text):
         return False
     exact_confirmations = {
         "sim", "confirmo", "confirmar", "pode", "pode fazer", "pode executar",
-        "faca", "faz isso", "execute", "pode ativar", "ativa", "ative",
+        "faca", "faz isso", "faca isso", "entao faz", "entao faca",
+        "execute", "executa isso", "execute isso", "aplica isso", "aplique isso",
+        "pode aplicar", "pode aplicar isso", "pode executar isso", "pode seguir",
+        "faz o que voce falou", "faca o que voce falou",
+        "faz o que voce recomendou", "faca o que voce recomendou",
+        "execute a recomendacao", "executa a recomendacao",
+        "aplique a recomendacao", "aplica a recomendacao",
+        "coloca isso em pratica", "coloque isso em pratica",
+        "pode colocar em pratica", "segue com isso", "pode seguir com isso",
+        "pode ativar", "ativa", "ative",
         "manda bala", "sim pode", "sim pode fazer", "sim pode executar",
         "sim faca", "sim execute", "confirmado",
     }
@@ -8674,6 +8742,9 @@ Use o mínimo de ferramentas. Responda objetivamente. Para dados reais da conta,
 ROTA: OPERAÇÃO
 Priorize ferramentas de orçamento/ação. Para alterar orçamento use propor_alteracao_orcamento. Para pausa/reativação use propor_acao_meta.
 A proposta não executa nada: explique antes/depois e peça confirmação. Não distribua redução entre vários conjuntos sem autorização clara.
+Se a mensagem atual for uma continuação curta como "faz isso", "então faça", "aplica isso" ou "execute a recomendação", use MEMÓRIA RESUMIDA e TURNOS RECENTES para recuperar a recomendação imediatamente anterior.
+Se já existir uma ação pendente inequívoca, o backend normalmente trata a confirmação antes desta rota. Se ainda não existir, transforme a recomendação anterior em uma proposta usando as ferramentas disponíveis.
+Se a referência anterior não for suficiente para identificar com segurança alvo/valor/ação, faça UMA pergunta objetiva de esclarecimento. Nunca diga que a ferramenta de gerenciamento está indisponível apenas porque a mensagem atual não repetiu os detalhes da recomendação anterior.
 """.strip(),
     "analysis": """
 ROTA: ANÁLISE
@@ -8981,10 +9052,14 @@ def v10_capabilities():
 
 
 @app.route("/v11-capabilities", methods=["GET"])
+@app.route("/v111-capabilities", methods=["GET"])
 def v11_capabilities():
     return {
         "build_id": BUILD_ID,
         "smart_model_routing": SMART_MODEL_ROUTING_ENABLED,
+        "context_aware_operational_followup": True,
+        "short_followup_routes_to_operational": True,
+        "pending_action_native_confirmation": True,
         "fast_model": OPENAI_FAST_MODEL,
         "deep_model": OPENAI_DEEP_MODEL,
         "deep_analysis_preserved": True,
