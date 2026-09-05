@@ -31,7 +31,7 @@ from psycopg.rows import dict_row
 
 app = Flask(__name__)
 
-BUILD_ID = "v10.6-permission-memory-decoupled-2026-09-04"
+BUILD_ID = "v10.7-native-rollback-openai-resilience-2026-09-04"
 ANALYSIS_ENGINE = "meta_driven_v9_1_action_ai_v10_2"
 OBJECTIVE_MAPPING_HARDCODED = False
 print("BOOT BUILD_ID:", BUILD_ID)
@@ -140,6 +140,11 @@ active_analysis_users = set()
 active_analysis_lock = threading.Lock()
 review_watcher_started = False
 review_watcher_lock = threading.Lock()
+
+# V10.7 — evita inundar o WhatsApp do administrador durante uma indisponibilidade da OpenAI.
+openai_incident_alert_lock = threading.Lock()
+openai_incident_last_alert = {}
+OPENAI_INCIDENT_ALERT_COOLDOWN_SECONDS = 900
 
 
 # =========================================================
@@ -430,6 +435,18 @@ def initialize_database():
                     """
                     CREATE INDEX IF NOT EXISTS idx_pending_actions_user_status
                     ON pending_actions(user_id, status, created_at DESC);
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE pending_actions
+                    ADD COLUMN IF NOT EXISTS reverses_action_id BIGINT;
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_pending_actions_reverses_action
+                    ON pending_actions(reverses_action_id, status);
                     """
                 )
 
@@ -1447,6 +1464,8 @@ def home():
         "progress_update_seconds": PROGRESS_UPDATE_SECONDS,
         "review_watcher": "enabled" if REVIEW_WATCH_ENABLED else "disabled",
         "transcribe_model": OPENAI_TRANSCRIBE_MODEL,
+        "native_rollback": "enabled",
+        "openai_outage_handling": "enabled",
     }, 200
 
 
@@ -2036,9 +2055,185 @@ def start_request_progress(sender):
     return WhatsAppProgressHeartbeat(sender).start()
 
 
+def _extract_openai_error_details(error):
+    """Extrai status/código sem depender de uma versão específica do SDK."""
+    raw = str(error or "")
+    status_code = getattr(error, "status_code", None)
+    body = getattr(error, "body", None)
+    code = None
+    error_type = None
+
+    if isinstance(body, dict):
+        payload = body.get("error") if isinstance(body.get("error"), dict) else body
+        code = payload.get("code")
+        error_type = payload.get("type")
+
+    response = getattr(error, "response", None)
+    if status_code is None and response is not None:
+        status_code = getattr(response, "status_code", None)
+    if (not code or not error_type) and response is not None:
+        try:
+            payload = response.json()
+            if isinstance(payload, dict):
+                payload = payload.get("error") if isinstance(payload.get("error"), dict) else payload
+                code = code or payload.get("code")
+                error_type = error_type or payload.get("type")
+        except Exception:
+            pass
+
+    normalized = normalize_text(raw)
+    module_name = str(getattr(error.__class__, "__module__", "") or "").lower()
+    class_name = str(getattr(error.__class__, "__name__", "") or "").lower()
+    looks_openai = (
+        "openai" in module_name
+        or "openai" in normalized
+        or "ratelimiterror" in class_name
+        or "apiconnectionerror" in class_name
+        or "apitimeouterror" in class_name
+        or "apierror" in class_name
+        or any(token in normalized for token in [
+            "credit_balance_exhausted",
+            "organization_usage_limit_exceeded",
+            "organization_spend_limit_exceeded",
+            "project_spend_limit_exceeded",
+            "insufficient_quota",
+        ])
+    )
+
+    return {
+        "raw": raw,
+        "normalized": normalized,
+        "status_code": status_code,
+        "code": str(code or "").strip() or None,
+        "error_type": str(error_type or "").strip() or None,
+        "class_name": class_name,
+        "looks_openai": looks_openai,
+    }
+
+
+def classify_openai_error(error):
+    details = _extract_openai_error_details(error)
+    if not details["looks_openai"]:
+        return None
+
+    normalized = details["normalized"]
+    code = normalize_text(details.get("code") or "")
+    error_type = normalize_text(details.get("error_type") or "")
+    status_code = details.get("status_code")
+    class_name = details.get("class_name") or ""
+
+    billing_codes = {
+        "credit_balance_exhausted",
+        "organization_usage_limit_exceeded",
+        "organization_spend_limit_exceeded",
+        "project_spend_limit_exceeded",
+    }
+    if code in billing_codes or any(x in normalized for x in billing_codes):
+        return {**details, "kind": "billing", "incident_code": code or "billing_limit"}
+    if error_type == "insufficient_quota" or "insufficient_quota" in normalized:
+        return {**details, "kind": "billing", "incident_code": code or "insufficient_quota"}
+
+    if (
+        "apitimeouterror" in class_name
+        or "timeout" in normalized
+        or "timed out" in normalized
+    ):
+        return {**details, "kind": "timeout", "incident_code": code or "timeout"}
+
+    if (
+        "apiconnectionerror" in class_name
+        or "connection" in normalized
+        or "conexao" in normalized
+        or "conexão" in normalized
+    ):
+        return {**details, "kind": "connection", "incident_code": code or "connection_error"}
+
+    if status_code == 429 or "ratelimiterror" in class_name or "rate limit" in normalized:
+        return {**details, "kind": "rate_limit", "incident_code": code or "rate_limit"}
+
+    if isinstance(status_code, int) and status_code >= 500:
+        return {**details, "kind": "service", "incident_code": code or f"http_{status_code}"}
+
+    return {**details, "kind": "service", "incident_code": code or "openai_error"}
+
+
+def notify_admin_openai_incident(error, stage="solicitação"):
+    incident = classify_openai_error(error)
+    if not incident or not ADMIN_WHATSAPP_NUMBER:
+        return incident
+
+    key = f"{incident['kind']}:{incident.get('incident_code')}"
+    now = time.time()
+    should_send = False
+    with openai_incident_alert_lock:
+        last = openai_incident_last_alert.get(key, 0)
+        if now - last >= OPENAI_INCIDENT_ALERT_COOLDOWN_SECONDS:
+            openai_incident_last_alert[key] = now
+            should_send = True
+
+    if should_send:
+        labels = {
+            "billing": "créditos/limite de uso",
+            "rate_limit": "limite de taxa temporário",
+            "timeout": "timeout",
+            "connection": "falha de conexão",
+            "service": "indisponibilidade do serviço",
+        }
+        try:
+            send_whatsapp_message(
+                ADMIN_WHATSAPP_NUMBER,
+                (
+                    "🚨 ALERTA OPENAI\n\n"
+                    f"Motivo: {labels.get(incident['kind'], incident['kind'])}\n"
+                    f"Código: {incident.get('incident_code') or 'não informado'}\n"
+                    f"Etapa: {stage}\n\n"
+                    "As ações nativas do backend, incluindo o rollback de alterações suportadas, continuam disponíveis."
+                ),
+            )
+        except Exception as alert_error:
+            print("[V10.7] OPENAI_ADMIN_ALERT_FAILED", repr(alert_error))
+
+    return incident
+
+
 def build_user_friendly_error(error, stage="solicitação"):
+    incident = notify_admin_openai_incident(error, stage=stage)
+    if incident:
+        if incident["kind"] == "billing":
+            return (
+                "⚠️ ASSISTENTE TEMPORARIAMENTE INDISPONÍVEL\n\n"
+                "Não consegui interpretar esta solicitação agora porque o serviço de IA está temporariamente indisponível.\n\n"
+                "Nenhuma nova alteração foi executada por este pedido.\n\n"
+                "Se você quiser desfazer a última alteração já executada, envie exatamente:\n\n"
+                "desfazer última alteração"
+            )
+        if incident["kind"] == "rate_limit":
+            return (
+                "⏳ ASSISTENTE TEMPORARIAMENTE OCUPADO\n\n"
+                "O serviço de IA atingiu um limite temporário de processamento. Nenhuma nova alteração foi executada por este pedido.\n\n"
+                "Tente novamente em alguns instantes. Se a intenção for reverter a última alteração, envie: desfazer última alteração"
+            )
+        return (
+            "⚠️ ASSISTENTE TEMPORARIAMENTE INDISPONÍVEL\n\n"
+            "Não consegui concluir a interpretação desta solicitação agora. Nenhuma nova alteração foi executada por este pedido.\n\n"
+            "Você pode tentar novamente em alguns instantes. Para reverter a última alteração suportada, envie: desfazer última alteração"
+        )
+
     raw = str(error or "")
     normalized = normalize_text(raw)
+
+    if "rollback_parcial" in normalized or "rollback parcial" in normalized:
+        return (
+            "⚠️ ROLLBACK PARCIAL\n\n"
+            "A reversão encontrou uma falha no meio da execução e nem todos os itens puderam ser compensados com segurança.\n\n"
+            "Não vou assumir que tudo voltou ao estado anterior. A estrutura precisa ser conferida antes de uma nova alteração."
+        )
+    if "rollback_compensado" in normalized or "rollback compensado" in normalized:
+        return (
+            "↩️ NÃO CONSEGUI CONCLUIR O DESFAZER\n\n"
+            "A reversão encontrou uma falha, mas as mudanças que já tinham começado foram devolvidas ao estado anterior.\n\n"
+            "Nenhuma reversão ficou aplicada. Você pode tentar novamente mais tarde."
+        )
 
     if "expirada" in normalized or "expired" in normalized or "oauth" in normalized or "access token" in normalized:
         return (
@@ -4118,6 +4313,47 @@ def receive_webhook():
             send_whatsapp_message(sender, menu)
             return "EVENT_RECEIVED", 200
 
+        # =================================================
+        # V10.7 — UNDO/ROLLBACK NATIVO (SEM OPENAI)
+        # =================================================
+
+        if is_native_rollback_request(original_text):
+            try:
+                rollback = prepare_native_rollback(dict(context))
+                send_whatsapp_message(sender, format_native_rollback_proposal(rollback))
+            except Exception as error:
+                print("[V10.7] NATIVE_ROLLBACK_PREPARE_ERROR", repr(error))
+                send_whatsapp_message(sender, build_user_friendly_error(error, stage="preparação do rollback"))
+            return "EVENT_RECEIVED", 200
+
+        pending_rollback = None
+        try:
+            pending_rollback = get_pending_native_rollback(context)
+        except Exception as rollback_lookup_error:
+            print("[V10.7] NATIVE_ROLLBACK_LOOKUP_ERROR", repr(rollback_lookup_error))
+
+        if pending_rollback and (
+            is_native_rollback_confirmation(original_text)
+            or is_explicit_confirmation_text(original_text)
+        ):
+            rollback_context = dict(context)
+            rollback_context["_current_user_text"] = original_text
+            try:
+                result = confirm_pending_action(rollback_context, pending_rollback["id"])
+                send_whatsapp_message(sender, format_native_rollback_result(result))
+            except Exception as error:
+                print("[V10.7] NATIVE_ROLLBACK_EXECUTE_ERROR", repr(error))
+                send_whatsapp_message(sender, build_user_friendly_error(error, stage="execução do rollback"))
+            return "EVENT_RECEIVED", 200
+
+        if pending_rollback and is_native_rollback_cancel(original_text):
+            result = cancel_pending_action(context, pending_rollback["id"])
+            if result.get("cancelled"):
+                send_whatsapp_message(sender, "✅ DESFAZER CANCELADO\n\nNenhuma reversão foi executada.")
+            else:
+                send_whatsapp_message(sender, "ℹ️ Não havia um rollback pendente para cancelar.")
+            return "EVENT_RECEIVED", 200
+
         print(
             "[DYNAMIC] ROUTING_TO_AI",
             {"build_id": BUILD_ID, "sender": sender, "text": original_text},
@@ -5578,6 +5814,8 @@ def action_summary(action_type, target_type, target_id, spec, summary=None):
         return f"Alterar orçamento de {target_type} {target_id} para {spec.get('amount_major')} {spec.get('budget_kind', 'daily_budget')}."
     if action_type == "batch_set_budget":
         return f"Alterar orçamento de {len(spec.get('items') or [])} estrutura(s), após validação do valor atual."
+    if action_type == "rollback_action":
+        return f"Desfazer uma alteração anterior com {len(spec.get('items') or [])} restauração(ões) validada(s)."
     if action_type == "duplicate":
         return f"Duplicar {target_type} {target_id} mantendo a cópia pausada."
     if action_type == "create_pixel":
@@ -5595,7 +5833,7 @@ def validate_action_request(context, action_type, target_type=None, target_id=No
     if not ACTION_AI_ENABLED:
         raise RuntimeError("Action AI está desativitado no ambiente.")
 
-    manage_actions = {"set_status", "set_budget", "batch_set_budget", "update_adset", "create_pixel", "activate_structure"}
+    manage_actions = {"set_status", "set_budget", "batch_set_budget", "update_adset", "create_pixel", "activate_structure", "rollback_action"}
     create_actions = {"duplicate"}
     if action_type in manage_actions and not context.get("can_manage_ads"):
         raise PermissionError(
@@ -5647,6 +5885,53 @@ def validate_action_request(context, action_type, target_type=None, target_id=No
             expected = float(expected) if expected is not None else None
             normalized.append({**item, "budget_kind": kind, "amount_major": amount, "expected_current_amount_major": expected})
         spec["items"] = normalized
+
+    elif action_type == "rollback_action":
+        original_action_id = int(spec.get("original_action_id") or 0)
+        if original_action_id <= 0:
+            raise ValueError("Rollback sem ação original válida.")
+        items = list(spec.get("items") or [])
+        if not items:
+            raise ValueError("Rollback sem alterações reversíveis.")
+        normalized_items = []
+        for item in items:
+            item = dict(item or {})
+            item_kind = str(item.get("kind") or "").lower()
+            item_target_type = item.get("target_type")
+            item_target_id = item.get("target_id")
+            if item_target_type not in {"campaign", "adset", "ad"} or not item_target_id:
+                raise ValueError("Alvo inválido no rollback.")
+            ensure_target_belongs_to_account(context, item_target_type, item_target_id)
+            if item_kind == "budget":
+                budget_kind = item.get("budget_kind", "daily_budget")
+                if budget_kind not in {"daily_budget", "lifetime_budget"}:
+                    raise ValueError("Tipo de orçamento inválido no rollback.")
+                expected = float(item.get("expected_current_amount_major"))
+                restore = float(item.get("restore_amount_major"))
+                if restore <= 0:
+                    raise ValueError("Valor de restauração precisa ser maior que zero.")
+                normalized_items.append({
+                    **item,
+                    "kind": "budget",
+                    "budget_kind": budget_kind,
+                    "expected_current_amount_major": expected,
+                    "restore_amount_major": restore,
+                })
+            elif item_kind == "status":
+                expected_status = str(item.get("expected_current_status") or "").upper()
+                restore_status = str(item.get("restore_status") or "").upper()
+                if expected_status not in {"ACTIVE", "PAUSED"} or restore_status not in {"ACTIVE", "PAUSED"}:
+                    raise ValueError("Status inválido no rollback.")
+                normalized_items.append({
+                    **item,
+                    "kind": "status",
+                    "expected_current_status": expected_status,
+                    "restore_status": restore_status,
+                })
+            else:
+                raise ValueError("Tipo de rollback não suportado.")
+        spec["original_action_id"] = original_action_id
+        spec["items"] = normalized_items
 
     elif action_type == "duplicate":
         if target_type not in ACTION_TARGET_TYPES:
@@ -5749,8 +6034,18 @@ def execute_action_spec(context, action):
     spec = validate_action_request(context, action_type, target_type, target_id, action.get("spec") or {})
 
     if action_type == "set_status":
+        current_data = meta_graph_get(context, str(target_id), fields="id,name,account_id,status")
+        before_status = str(current_data.get("status") or "").upper() or None
         result = meta_graph_post(context, str(target_id), {"status": spec["status"]})
-        return {"target_type": target_type, "target_id": target_id, "status": spec["status"], "meta": result}
+        return {
+            "target_type": target_type,
+            "target_id": target_id,
+            "target_name": current_data.get("name"),
+            "before_status": before_status,
+            "after_status": spec["status"],
+            "status": spec["status"],
+            "meta": result,
+        }
 
     if action_type == "set_budget":
         expected = spec.get("expected_current_amount_major")
@@ -5809,6 +6104,116 @@ def execute_action_spec(context, action):
             "currency": context.get("meta_currency") or "BRL",
             "changed_count": len(results),
             "changes": results,
+        }
+
+    if action_type == "rollback_action":
+        items = spec["items"]
+        preflight = []
+        for item in items:
+            if item["kind"] == "budget":
+                current_data = meta_graph_get(
+                    context,
+                    str(item["target_id"]),
+                    fields=f"id,name,account_id,{item['budget_kind']}",
+                )
+                current = currency_to_major(context, current_data.get(item["budget_kind"]))
+                expected = item["expected_current_amount_major"]
+                if current is None or abs(float(current) - float(expected)) > 0.01:
+                    raise RuntimeError(
+                        f"Não posso desfazer com segurança: o orçamento de '{item.get('target_name') or item['target_id']}' "
+                        f"mudou depois da ação original ({expected} -> {current}). Nenhuma reversão foi iniciada."
+                    )
+                preflight.append({**item, "current_verified": current})
+            else:
+                current_data = meta_graph_get(
+                    context,
+                    str(item["target_id"]),
+                    fields="id,name,account_id,status",
+                )
+                current_status = str(current_data.get("status") or "").upper()
+                expected_status = item["expected_current_status"]
+                if current_status != expected_status:
+                    raise RuntimeError(
+                        f"Não posso desfazer com segurança: o status de '{item.get('target_name') or item['target_id']}' "
+                        f"mudou depois da ação original ({expected_status} -> {current_status}). Nenhuma reversão foi iniciada."
+                    )
+                preflight.append({**item, "current_verified": current_status})
+
+        changes = []
+        applied = []
+        try:
+            for item in preflight:
+                if item["kind"] == "budget":
+                    restore_minor = currency_to_minor(context, item["restore_amount_major"])
+                    meta_result = meta_graph_post(
+                        context,
+                        str(item["target_id"]),
+                        {item["budget_kind"]: restore_minor},
+                    )
+                    change = {
+                        "kind": "budget",
+                        "target_type": item["target_type"],
+                        "target_id": item["target_id"],
+                        "target_name": item.get("target_name"),
+                        "before": item["current_verified"],
+                        "after": item["restore_amount_major"],
+                        "budget_kind": item["budget_kind"],
+                        "meta": meta_result,
+                    }
+                else:
+                    meta_result = meta_graph_post(
+                        context,
+                        str(item["target_id"]),
+                        {"status": item["restore_status"]},
+                    )
+                    change = {
+                        "kind": "status",
+                        "target_type": item["target_type"],
+                        "target_id": item["target_id"],
+                        "target_name": item.get("target_name"),
+                        "before": item["current_verified"],
+                        "after": item["restore_status"],
+                        "meta": meta_result,
+                    }
+                changes.append(change)
+                applied.append(item)
+        except Exception as rollback_error:
+            compensation_errors = []
+            for applied_item in reversed(applied):
+                try:
+                    if applied_item["kind"] == "budget":
+                        original_minor = currency_to_minor(context, applied_item["current_verified"])
+                        meta_graph_post(
+                            context,
+                            str(applied_item["target_id"]),
+                            {applied_item["budget_kind"]: original_minor},
+                        )
+                    else:
+                        meta_graph_post(
+                            context,
+                            str(applied_item["target_id"]),
+                            {"status": applied_item["current_verified"]},
+                        )
+                except Exception as compensation_error:
+                    compensation_errors.append({
+                        "target_id": applied_item.get("target_id"),
+                        "error": str(compensation_error),
+                    })
+            if compensation_errors:
+                raise RuntimeError(
+                    "ROLLBACK_PARCIAL: a reversão falhou durante a execução e a compensação de alguns itens também falhou. "
+                    f"Itens que exigem conferência manual: {json.dumps(compensation_errors, ensure_ascii=False)}"
+                ) from rollback_error
+            raise RuntimeError(
+                "ROLLBACK_COMPENSADO: a reversão encontrou um erro durante a execução, mas todas as mudanças já iniciadas "
+                "foram devolvidas ao estado que tinham antes do pedido de desfazer."
+            ) from rollback_error
+
+        return {
+            "rolled_back": True,
+            "original_action_id": spec["original_action_id"],
+            "changed_count": len(changes),
+            "changes": changes,
         }
 
     if action_type == "duplicate":
@@ -5929,6 +6334,273 @@ def list_pending_actions(context):
                 (context["company_id"], context["user_id"]),
             )
             return cursor.fetchall()
+
+
+def _last_executed_action_for_rollback(context):
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM pending_actions pa
+                WHERE pa.company_id=%s
+                  AND pa.user_id=%s
+                  AND pa.ad_account_id=%s
+                  AND pa.status='EXECUTED'
+                  AND pa.action_type <> 'rollback_action'
+                ORDER BY pa.executed_at DESC NULLS LAST, pa.id DESC
+                LIMIT 1;
+                """,
+                (context["company_id"], context["user_id"], context["ad_account_id"]),
+            )
+            return cursor.fetchone()
+
+
+def _existing_rollback_for_action(context, original_action_id):
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM pending_actions
+                WHERE company_id=%s
+                  AND user_id=%s
+                  AND reverses_action_id=%s
+                  AND status IN ('PENDING_CONFIRMATION','EXECUTING','EXECUTED')
+                ORDER BY id DESC
+                LIMIT 1;
+                """,
+                (context["company_id"], context["user_id"], int(original_action_id)),
+            )
+            return cursor.fetchone()
+
+
+def _rollback_items_from_action(action):
+    action_type = action.get("action_type")
+    spec = dict(action.get("spec") or {})
+    result = dict(action.get("result") or {})
+    items = []
+
+    if action_type == "batch_set_budget":
+        for change in result.get("changes") or []:
+            before = change.get("before")
+            after = change.get("after")
+            if before is None or after is None:
+                continue
+            items.append({
+                "kind": "budget",
+                "target_type": change.get("target_type"),
+                "target_id": change.get("target_id"),
+                "target_name": change.get("target_name"),
+                "budget_kind": change.get("budget_kind") or "daily_budget",
+                "expected_current_amount_major": float(after),
+                "restore_amount_major": float(before),
+            })
+        return items
+
+    if action_type == "set_budget":
+        before = spec.get("expected_current_amount_major")
+        after = result.get("amount_major", spec.get("amount_major"))
+        if before is None or after is None:
+            return []
+        return [{
+            "kind": "budget",
+            "target_type": action.get("target_type"),
+            "target_id": action.get("target_id"),
+            "target_name": result.get("target_name") or action.get("target_id"),
+            "budget_kind": result.get("budget_kind") or spec.get("budget_kind") or "daily_budget",
+            "expected_current_amount_major": float(after),
+            "restore_amount_major": float(before),
+        }]
+
+    if action_type == "set_status":
+        before_status = str(result.get("before_status") or "").upper()
+        after_status = str(result.get("after_status") or result.get("status") or "").upper()
+        if before_status not in {"ACTIVE", "PAUSED"} or after_status not in {"ACTIVE", "PAUSED"}:
+            return []
+        return [{
+            "kind": "status",
+            "target_type": action.get("target_type"),
+            "target_id": action.get("target_id"),
+            "target_name": result.get("target_name") or action.get("target_id"),
+            "expected_current_status": after_status,
+            "restore_status": before_status,
+        }]
+
+    if action_type == "activate_structure":
+        ids = dict(spec.get("ids") or {})
+        if ids.get("campaign_id"):
+            items.append({
+                "kind": "status", "target_type": "campaign", "target_id": ids["campaign_id"],
+                "target_name": "Campanha criada", "expected_current_status": "ACTIVE", "restore_status": "PAUSED",
+            })
+        if ids.get("adset_id"):
+            items.append({
+                "kind": "status", "target_type": "adset", "target_id": ids["adset_id"],
+                "target_name": "Conjunto criado", "expected_current_status": "ACTIVE", "restore_status": "PAUSED",
+            })
+        for ad_id in ids.get("ad_ids") or []:
+            items.append({
+                "kind": "status", "target_type": "ad", "target_id": ad_id,
+                "target_name": f"Anúncio {ad_id}", "expected_current_status": "ACTIVE", "restore_status": "PAUSED",
+            })
+        return items
+
+    return []
+
+
+def prepare_native_rollback(context):
+    refresh_context_permissions(context)
+    if not context.get("can_manage_ads"):
+        return {"prepared": False, "reason": "Este acesso não possui permissão de gerenciamento."}
+    ensure_meta_ads_management(context)
+
+    original = _last_executed_action_for_rollback(context)
+    if not original:
+        return {"prepared": False, "reason": "Não encontrei nenhuma alteração executada para desfazer nesta conta."}
+
+    existing = _existing_rollback_for_action(context, original["id"])
+    if existing:
+        if existing.get("status") == "EXECUTED":
+            return {"prepared": False, "reason": "A última alteração executada já foi desfeita."}
+        return {
+            "prepared": True,
+            "already_pending": True,
+            "rollback_action_id": existing["id"],
+            "original_action_id": original["id"],
+            "summary": existing.get("summary"),
+            "items": (existing.get("spec") or {}).get("items") or [],
+        }
+
+    items = _rollback_items_from_action(original)
+    if not items:
+        return {
+            "prepared": False,
+            "reason": (
+                "A última alteração executada não possui reversão automática segura nesta versão. "
+                "Não vou tentar adivinhar o estado anterior."
+            ),
+            "original_action_id": original["id"],
+            "original_action_type": original.get("action_type"),
+        }
+
+    summary_parts = []
+    for item in items[:20]:
+        name = item.get("target_name") or item.get("target_id")
+        if item["kind"] == "budget":
+            summary_parts.append(
+                f"{name}: {item['expected_current_amount_major']} -> {item['restore_amount_major']} ({item['budget_kind']})"
+            )
+        else:
+            summary_parts.append(f"{name}: {item['expected_current_status']} -> {item['restore_status']}")
+    summary = "Desfazer a última alteração: " + "; ".join(summary_parts)
+
+    rollback = create_pending_action(
+        context,
+        action_type="rollback_action",
+        target_type=None,
+        target_id=None,
+        spec={"original_action_id": int(original["id"]), "items": items},
+        summary=summary,
+    )
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "UPDATE pending_actions SET reverses_action_id=%s WHERE id=%s;",
+                (int(original["id"]), int(rollback["action_id"])),
+            )
+
+    return {
+        "prepared": True,
+        "rollback_action_id": rollback["action_id"],
+        "original_action_id": original["id"],
+        "original_action_type": original.get("action_type"),
+        "items": items,
+        "summary": summary,
+        "confirmation_required": True,
+    }
+
+
+def get_pending_native_rollback(context):
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT * FROM pending_actions
+                WHERE company_id=%s AND user_id=%s AND ad_account_id=%s
+                  AND action_type='rollback_action'
+                  AND status='PENDING_CONFIRMATION'
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1;
+                """,
+                (context["company_id"], context["user_id"], context["ad_account_id"]),
+            )
+            return cursor.fetchone()
+
+
+def format_native_rollback_proposal(data):
+    if not data.get("prepared"):
+        return "↩️ NÃO CONSEGUI PREPARAR O DESFAZER\n\n" + str(data.get("reason") or "Não há alteração reversível disponível.")
+
+    lines = ["↩️ DESFAZER ÚLTIMA ALTERAÇÃO", ""]
+    for item in data.get("items") or []:
+        name = item.get("target_name") or item.get("target_id")
+        if item.get("kind") == "budget":
+            lines.append(f"• {name}")
+            lines.append(f"  Atual: {item['expected_current_amount_major']}")
+            lines.append(f"  Restaurar: {item['restore_amount_major']}")
+        else:
+            lines.append(f"• {name}: {item['expected_current_status']} → {item['restore_status']}")
+    lines.extend([
+        "",
+        "Nenhuma reversão foi executada ainda.",
+        "",
+        "Para confirmar, responda:",
+        "CONFIRMAR DESFAZER",
+    ])
+    return "\n".join(lines)
+
+
+def format_native_rollback_result(result):
+    if not result.get("executed"):
+        return "↩️ NÃO CONSEGUI DESFAZER\n\n" + str(result.get("reason") or "A reversão não foi executada.")
+    payload = result.get("result") or {}
+    lines = ["✅ ALTERAÇÃO DESFEITA", ""]
+    for change in payload.get("changes") or []:
+        name = change.get("target_name") or change.get("target_id")
+        if change.get("kind") == "budget":
+            lines.append(f"• {name}: {change.get('before')} → {change.get('after')}")
+        else:
+            lines.append(f"• {name}: {change.get('before')} → {change.get('after')}")
+    if len(lines) == 2:
+        lines.append("A última alteração suportada foi revertida.")
+    return "\n".join(lines)
+
+
+def is_native_rollback_request(text):
+    n = normalize_text(text or "").strip()
+    exact = {
+        "desfazer", "desfaz", "desfaz isso", "desfazer isso", "rollback", "reverter",
+        "reverter isso", "voltar alteracao", "voltar alteração", "desfazer ultima alteracao",
+        "desfazer última alteração", "reverter ultima alteracao", "reverter última alteração",
+        "voltar como estava", "volta como estava",
+    }
+    return n in {normalize_text(x) for x in exact}
+
+
+def is_native_rollback_confirmation(text):
+    n = normalize_text(text or "").strip()
+    exact = {
+        "confirmar desfazer", "confirmo desfazer", "pode desfazer", "pode reverter",
+        "confirmar rollback", "confirmo rollback", "sim desfaz", "sim pode desfazer",
+    }
+    return n in {normalize_text(x) for x in exact}
+
+
+def is_native_rollback_cancel(text):
+    n = normalize_text(text or "").strip()
+    exact = {"cancelar desfazer", "cancela desfazer", "nao desfazer", "não desfazer", "cancelar rollback"}
+    return n in {normalize_text(x) for x in exact}
 
 
 def list_pixels(context):
@@ -6943,6 +7615,15 @@ ACTION_AI_TOOLS = [
     },
     {
         "type": "function",
+        "name": "preparar_rollback_ultima_acao",
+        "description": (
+            "Prepara, sem executar, a reversão segura da última alteração suportada. "
+            "Orçamento e alterações de status registradas com estado anterior podem ser restauradas. Sempre exige confirmação."
+        ),
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "type": "function",
         "name": "consultar_orcamentos",
         "description": (
             "Consulta o orçamento CONFIGURADO na Meta, separado de gasto. Identifica se o orçamento é controlado "
@@ -7265,6 +7946,9 @@ V10 ACTION AI — PRINCÍPIO DE SEGURANÇA
 - Se o cliente responder "faça", "pode fazer", "pode ativar", "confirmo" etc., use confirmar_acao_pendente. O backend ainda verifica a mensagem real antes de executar.
 - Se houver mais de uma ação pendente e a referência estiver ambígua, liste as ações e pergunte qual delas.
 - Nunca trate um "sim" fora de contexto como autorização para gasto ou alteração.
+- Se o cliente pedir para desfazer/reverter a última alteração, use preparar_rollback_ultima_acao. O rollback também exige confirmação.
+- Nunca invente o estado anterior. Se o backend disser que a ação não é reversível com segurança, explique isso.
+- O rollback nativo pode funcionar mesmo quando a OpenAI está indisponível; não diga que toda reversão depende da IA.
 
 CRIAÇÃO DE CAMPANHA — WIZARD HÍBRIDO V10.2
 - Quando o cliente disser que quer criar/montar uma campanha, use iniciar_wizard_campanha.
@@ -7453,6 +8137,9 @@ def execute_dynamic_tool(context, tool_name, arguments):
     if tool_name == "listar_acoes_pendentes":
         return list_pending_actions(context)
 
+    if tool_name == "preparar_rollback_ultima_acao":
+        return prepare_native_rollback(context)
+
     if tool_name == "consultar_orcamentos":
         return query_meta_budgets(
             context,
@@ -7568,6 +8255,7 @@ def v91_capabilities():
 @app.route("/v103-capabilities", methods=["GET"])
 @app.route("/v105-capabilities", methods=["GET"])
 @app.route("/v106-capabilities", methods=["GET"])
+@app.route("/v107-capabilities", methods=["GET"])
 def v10_capabilities():
     return {
         "build_id": BUILD_ID,
@@ -7587,6 +8275,11 @@ def v10_capabilities():
         "conversation_reset_after_permission_change": False,
         "conversation_memory_preserved_on_permission_change": True,
         "permissions_and_memory_decoupled": True,
+        "native_rollback_enabled": True,
+        "native_rollback_without_openai": True,
+        "rollback_requires_confirmation": True,
+        "openai_outage_user_friendly_handling": True,
+        "openai_admin_incident_alert": True,
         "current_permissions_injected_into_ai_prompt": True,
         "meta_ads_management_check": True,
         "budget_intelligence": True,
@@ -7595,6 +8288,7 @@ def v10_capabilities():
             "pause_activate_campaign_adset_ad",
             "read_configured_budget_campaign_adset",
             "change_budget_campaign_adset_with_preflight",
+            "native_rollback_last_supported_change",
             "batch_budget_change_with_single_confirmation",
             "update_adset_targeting_optimization",
             "duplicate_campaign_adset_ad_paused",
