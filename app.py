@@ -31,7 +31,7 @@ from psycopg.rows import dict_row
 
 app = Flask(__name__)
 
-BUILD_ID = "v11.2-operational-capability-routing-2026-09-05"
+BUILD_ID = "v11.3-simple-campaign-wizard-2026-09-05"
 ANALYSIS_ENGINE = "meta_driven_v11_1_context_routed"
 OBJECTIVE_MAPPING_HARDCODED = False
 print("BOOT BUILD_ID:", BUILD_ID)
@@ -177,6 +177,8 @@ WHATSAPP_TEMPLATE_LANGUAGE = os.getenv("WHATSAPP_TEMPLATE_LANGUAGE", "pt_BR")
 
 # V10.2 — Campaign Wizard / mídia / progresso
 CAMPAIGN_WIZARD_ENABLED = os.getenv("CAMPAIGN_WIZARD_ENABLED", "true").strip().lower() in {"1", "true", "yes", "sim"}
+WIZARD_SIMPLE_MODE_ENABLED = os.getenv("WIZARD_SIMPLE_MODE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "sim"}
+WIZARD_REUSE_ACTIVE_SETUP = os.getenv("WIZARD_REUSE_ACTIVE_SETUP", "true").strip().lower() in {"1", "true", "yes", "sim"}
 try:
     PROGRESS_UPDATE_SECONDS = max(20, int(os.getenv("PROGRESS_UPDATE_SECONDS", "50")))
 except ValueError:
@@ -4222,7 +4224,7 @@ def select_tools_for_route(route):
         "iniciar_wizard_campanha", "atualizar_wizard_campanha", "consultar_wizard_campanha",
         "editar_wizard_campanha", "cancelar_wizard_campanha", "listar_paginas_meta",
         "buscar_localizacoes_meta", "buscar_interesses_meta", "preparar_confirmacao_wizard",
-        "criar_campanha_do_wizard", "listar_pixels", "diagnosticar_permissoes_meta",
+        "criar_campanha_do_wizard", "listar_pixels", "diagnosticar_permissoes_meta", "listar_estrutura_meta",
     }
     simple_names = {"consultar_insights", "listar_estrutura_meta", "consultar_orcamentos", "consultar_revisao_anuncios"}
     if route == "wizard":
@@ -7968,6 +7970,327 @@ def deep_merge_dict(base, updates):
     return result
 
 
+
+def _wizard_extract_url(text):
+    match = re.search(r"https?://[^\s<>]+", str(text or ""), flags=re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(0).rstrip(".,);]}")
+
+
+def _wizard_human_goal_from_text(text):
+    """Extrai somente uma descrição de negócio suficientemente específica; evita gravar 'quero criar campanha' como objetivo."""
+    raw = str(text or "").strip()
+    normalized = normalize_text(raw)
+    generic = {
+        "quero criar uma campanha", "quero criar campanha", "criar campanha", "nova campanha",
+        "montar campanha", "quero montar uma campanha", "quero uma campanha",
+    }
+    if not raw or normalized in generic:
+        return None
+    business_terms = (
+        "anunciar", "divulgar", "vender", "captar", "cadastro", "lead", "mensagem", "whatsapp",
+        "site", "landing", "produto", "servico", "serviço", "imovel", "imóvel", "oferta", "evento",
+        "curso", "apartamento", "casa", "loja", "empresa", "agendamento", "orcamento", "orçamento",
+    )
+    if len(raw) >= 35 or any(term in normalized for term in business_terms):
+        return raw[:600]
+    return None
+
+
+def _wizard_short_label(value, fallback="Nova campanha"):
+    raw = re.sub(r"\s+", " ", str(value or "")).strip()
+    raw = re.sub(
+        r"^(quero|gostaria de|preciso|vamos|crie|criar|montar|quero criar|quero montar)\s+",
+        "",
+        raw,
+        flags=re.IGNORECASE,
+    ).strip(" -:,.!")
+    if not raw:
+        raw = fallback
+    return raw[:58]
+
+
+def _wizard_reference_score(campaign, adset, user_text=None):
+    score = 0
+    campaign = dict(campaign or {})
+    adset = dict(adset or {})
+    c_status = str(campaign.get("effective_status") or campaign.get("status") or "").upper()
+    a_status = str(adset.get("effective_status") or adset.get("status") or "").upper()
+    if a_status == "ACTIVE":
+        score += 120
+    elif a_status in {"PAUSED", "CAMPAIGN_PAUSED", "ADSET_PAUSED"}:
+        score += 25
+    if c_status == "ACTIVE":
+        score += 70
+    elif c_status in {"PAUSED", "CAMPAIGN_PAUSED"}:
+        score += 20
+    for key in ("optimization_goal", "billing_event", "promoted_object", "destination_type"):
+        if adset.get(key) not in (None, "", {}, []):
+            score += 10
+    if campaign.get("objective"):
+        score += 15
+
+    normalized_user = normalize_text(user_text or "")
+    searchable = normalize_text(json.dumps({
+        "campaign_name": campaign.get("name"),
+        "adset_name": adset.get("name"),
+        "objective": campaign.get("objective"),
+        "destination_type": adset.get("destination_type"),
+        "promoted_object": adset.get("promoted_object"),
+    }, ensure_ascii=False, default=str))
+    ignored = {"quero", "criar", "campanha", "anuncio", "anúncio", "para", "uma", "com", "meu", "minha"}
+    words = [w for w in re.findall(r"[a-z0-9_]+", normalized_user) if len(w) >= 4 and w not in ignored]
+    score += min(60, sum(6 for word in set(words) if word in searchable))
+    return score
+
+
+def _wizard_page_from_reference_adset(context, adset_id):
+    if not adset_id:
+        return None
+    try:
+        data = meta_graph_get(
+            context,
+            f"{adset_id}/ads",
+            fields="id,name,effective_status,creative{id,object_story_spec}",
+            params={"limit": 25},
+        )
+        ads = list(data.get("data") or [])
+        ads.sort(key=lambda ad: 0 if str(ad.get("effective_status") or "").upper() == "ACTIVE" else 1)
+        for ad in ads:
+            creative = ad.get("creative") or {}
+            story = creative.get("object_story_spec") or {}
+            page_id = story.get("page_id")
+            if page_id:
+                return str(page_id)
+    except Exception as error:
+        print("[V11.3] WIZARD_REFERENCE_PAGE_ERROR", repr(error))
+    return None
+
+
+def get_wizard_reference_setup(context, user_text=None, preferred_campaign_id=None, preferred_adset_id=None):
+    """
+    Busca uma configuração que a própria conta já utiliza para evitar perguntas técnicas ao leigo.
+    Nunca copia orçamento nem datas. Pixel/promoted_object, otimização, cobrança, público e Página
+    só são reaproveitados como configuração técnica de referência.
+    """
+    if not WIZARD_REUSE_ACTIVE_SETUP:
+        return None
+    try:
+        ad_account_id, access_token, credential_error = get_meta_credentials(context)
+        if credential_error:
+            return None
+        metadata = v91_fetch_setup_metadata(ad_account_id, access_token)
+        campaigns = metadata.get("campaigns") or {}
+        adsets = metadata.get("adsets") or {}
+        candidates = []
+        for adset_id, adset_raw in adsets.items():
+            adset = dict(adset_raw or {})
+            campaign_id = str(adset.get("campaign_id") or "")
+            campaign = dict(campaigns.get(campaign_id) or {})
+            if preferred_campaign_id and str(campaign_id) != str(preferred_campaign_id):
+                continue
+            if preferred_adset_id and str(adset_id) != str(preferred_adset_id):
+                continue
+            score = _wizard_reference_score(campaign, adset, user_text=user_text)
+            candidates.append((score, campaign_id, str(adset_id), campaign, adset))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        score, campaign_id, adset_id, campaign, adset = candidates[0]
+
+        targeting = None
+        try:
+            targeting_data = meta_graph_get(context, adset_id, fields="targeting")
+            targeting = targeting_data.get("targeting")
+        except Exception as error:
+            print("[V11.3] WIZARD_REFERENCE_TARGETING_ERROR", repr(error))
+
+        page_id = _wizard_page_from_reference_adset(context, adset_id)
+        if not page_id:
+            try:
+                pages = list_pages_for_wizard(context)
+                if len(pages) == 1 and pages[0].get("id"):
+                    page_id = str(pages[0]["id"])
+            except Exception as error:
+                print("[V11.3] WIZARD_REFERENCE_PAGES_ERROR", repr(error))
+
+        promoted_object = v91_compact_promoted_object(adset.get("promoted_object"))
+        pixel_id = promoted_object.get("pixel_id") if isinstance(promoted_object, dict) else None
+        return {
+            "score": score,
+            "campaign_id": campaign_id,
+            "campaign_name": campaign.get("name"),
+            "adset_id": adset_id,
+            "adset_name": adset.get("name"),
+            "campaign": {
+                "objective": campaign.get("objective"),
+                "buying_type": campaign.get("buying_type") or "AUCTION",
+                "special_ad_categories": campaign.get("special_ad_categories") if campaign.get("special_ad_categories") is not None else [],
+                "bid_strategy": campaign.get("bid_strategy"),
+            },
+            "adset": {
+                "optimization_goal": adset.get("optimization_goal"),
+                "optimization_sub_event": adset.get("optimization_sub_event"),
+                "billing_event": adset.get("billing_event"),
+                "bid_strategy": adset.get("bid_strategy"),
+                "promoted_object": promoted_object,
+                "destination_type": adset.get("destination_type"),
+                "attribution_spec": adset.get("attribution_spec"),
+                "targeting": targeting,
+            },
+            "creative": {"page_id": page_id},
+            "pixel_id": pixel_id,
+        }
+    except Exception as error:
+        print("[V11.3] WIZARD_REFERENCE_SETUP_ERROR", repr(error))
+        return None
+
+
+def _wizard_apply_reference_values(draft, reference):
+    draft = dict(draft or {})
+    if not reference:
+        return draft, []
+    reused = []
+    campaign = dict(draft.get("campaign") or {})
+    adset = dict(draft.get("adset") or {})
+    creative = dict(draft.get("creative") or {})
+
+    for key, value in (reference.get("campaign") or {}).items():
+        if value not in (None, "", {}, []) or key == "special_ad_categories":
+            if campaign.get(key) in (None, "", {}, []):
+                campaign[key] = value
+                reused.append(f"campaign.{key}")
+
+    for key, value in (reference.get("adset") or {}).items():
+        if value not in (None, "", {}, []):
+            if adset.get(key) in (None, "", {}, []):
+                adset[key] = value
+                reused.append(f"adset.{key}")
+
+    page_id = (reference.get("creative") or {}).get("page_id")
+    if page_id and not creative.get("page_id"):
+        creative["page_id"] = page_id
+        reused.append("creative.page_id")
+
+    draft["campaign"] = campaign
+    draft["adset"] = adset
+    draft["creative"] = creative
+    return draft, reused
+
+
+def apply_smart_wizard_defaults(context, draft, user_text=None, force_reference_refresh=False):
+    """Completa o que for seguro no backend para o cliente não precisar conhecer Meta Ads."""
+    draft = dict(draft or {})
+    campaign = dict(draft.get("campaign") or {})
+    adset = dict(draft.get("adset") or {})
+    creative = dict(draft.get("creative") or {})
+    smart = dict(draft.get("_smart_defaults") or {})
+    user_text = user_text if user_text is not None else context.get("_current_user_text")
+
+    if not campaign.get("business_goal"):
+        inferred_goal = _wizard_human_goal_from_text(user_text)
+        if inferred_goal:
+            campaign["business_goal"] = inferred_goal
+
+    goal = campaign.get("business_goal") or ""
+    stamp = get_today_for_context(context).strftime("%Y%m%d")
+    label = _wizard_short_label(goal, fallback="Nova campanha")
+    if not campaign.get("name"):
+        campaign["name"] = f"{label} | {stamp}"[:120]
+    if not adset.get("name"):
+        adset["name"] = f"{campaign['name']} | Conjunto 01"[:120]
+    if "special_ad_categories" not in campaign:
+        campaign["special_ad_categories"] = []
+    campaign.setdefault("buying_type", "AUCTION")
+    campaign.setdefault("is_adset_budget_sharing_enabled", False)
+    creative.setdefault("call_to_action_type", "LEARN_MORE")
+
+    found_url = _wizard_extract_url(user_text)
+    if found_url and not creative.get("destination_url"):
+        creative["destination_url"] = found_url
+
+    draft["campaign"] = campaign
+    draft["adset"] = adset
+    draft["creative"] = creative
+
+    should_fetch_reference = (
+        WIZARD_SIMPLE_MODE_ENABLED
+        and WIZARD_REUSE_ACTIVE_SETUP
+        and (force_reference_refresh or not smart.get("reference_attempted"))
+    )
+    reused = list(smart.get("reused_fields") or [])
+    reference = None
+    if should_fetch_reference:
+        reference = get_wizard_reference_setup(context, user_text=user_text)
+        smart["reference_attempted"] = True
+        if reference:
+            draft, new_reused = _wizard_apply_reference_values(draft, reference)
+            reused.extend(new_reused)
+            smart.update({
+                "reference_campaign_id": reference.get("campaign_id"),
+                "reference_campaign_name": reference.get("campaign_name"),
+                "reference_adset_id": reference.get("adset_id"),
+                "reference_adset_name": reference.get("adset_name"),
+                "pixel_reused": bool(reference.get("pixel_id")),
+                "page_reused": bool((reference.get("creative") or {}).get("page_id")),
+                "targeting_reused": bool((reference.get("adset") or {}).get("targeting")),
+            })
+        else:
+            smart["reference_found"] = False
+    elif smart.get("reference_campaign_id"):
+        smart["reference_found"] = True
+
+    smart["reused_fields"] = sorted(set(reused))
+    if smart.get("reference_campaign_id"):
+        smart["reference_found"] = True
+    draft["_smart_defaults"] = smart
+
+    # Recarrega após referência para não sobrescrever campos preenchidos acima.
+    campaign = dict(draft.get("campaign") or {})
+    adset = dict(draft.get("adset") or {})
+    creative = dict(draft.get("creative") or {})
+
+    # Copy mínimo automático: a IA pode melhorar depois, mas o leigo não precisa responder
+    # uma pergunta separada só por headline/copy quando já descreveu a oferta.
+    goal = str(campaign.get("business_goal") or "").strip()
+    if goal:
+        if not creative.get("headline"):
+            creative["headline"] = _wizard_short_label(goal, fallback="Saiba mais")[:80]
+            smart["auto_headline"] = True
+        if not creative.get("primary_text"):
+            clean_goal = re.sub(r"\s+", " ", goal).strip()
+            creative["primary_text"] = clean_goal[:650]
+            smart["auto_primary_text"] = True
+
+    draft["campaign"] = campaign
+    draft["adset"] = adset
+    draft["creative"] = creative
+    draft["_smart_defaults"] = smart
+    return draft
+
+
+def wizard_simple_progress(draft, assets=None):
+    draft = dict(draft or {})
+    campaign = dict(draft.get("campaign") or {})
+    adset = dict(draft.get("adset") or {})
+    creative = dict(draft.get("creative") or {})
+    assets = assets or []
+
+    if not str(campaign.get("business_goal") or "").strip() or not str(campaign.get("objective") or "").strip():
+        return {"step": 1, "total": 3, "label": "CAMPANHA", "ask": "O que você quer anunciar e qual resultado espera?"}
+    if adset.get("daily_budget_major") is None and adset.get("lifetime_budget_major") is None:
+        return {"step": 2, "total": 3, "label": "CONJUNTO", "ask": "Quanto você quer investir por dia? Se quiser mudar cidade/público, diga junto."}
+    if not adset.get("targeting"):
+        return {"step": 2, "total": 3, "label": "CONJUNTO", "ask": "Em qual cidade/região ou para qual público você quer anunciar?"}
+    if not assets and not list(draft.get("existing_creative_ids") or []):
+        return {"step": 3, "total": 3, "label": "ANÚNCIO", "ask": "Envie a imagem ou vídeo do anúncio. Se ele levar para um site, mande também o link."}
+    if assets and not str(creative.get("destination_url") or "").strip():
+        return {"step": 3, "total": 3, "label": "ANÚNCIO", "ask": "Qual é o link de destino desse anúncio?"}
+    return {"step": 3, "total": 3, "label": "REVISÃO", "ask": "Já tenho o necessário para montar o resumo e pedir sua confirmação."}
+
+
 def get_active_campaign_wizard(context):
     initialize_database()
     with get_db_connection() as conn:
@@ -7991,7 +8314,21 @@ def get_active_campaign_wizard(context):
     row["draft"] = dict(row.get("draft") or {})
     row["assets"] = list_campaign_wizard_assets(row["id"])
     row["missing"] = campaign_wizard_missing(row["draft"], row["assets"])
+    row["simple_flow"] = wizard_simple_progress(row["draft"], row["assets"])
     return row
+
+
+def _persist_wizard_draft(context, wizard_id, draft):
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE campaign_wizards
+                SET draft=%s::jsonb, updated_at=NOW()
+                WHERE id=%s AND company_id=%s AND user_id=%s;
+                """,
+                (json.dumps(draft, ensure_ascii=False, default=str), wizard_id, context["company_id"], context["user_id"]),
+            )
 
 
 def start_campaign_wizard(context, initial=None):
@@ -8005,9 +8342,16 @@ def start_campaign_wizard(context, initial=None):
 
     existing = get_active_campaign_wizard(context)
     if existing:
+        if existing.get("status") == "DRAFT" and WIZARD_SIMPLE_MODE_ENABLED:
+            refreshed = apply_smart_wizard_defaults(context, existing.get("draft") or {}, user_text=context.get("_current_user_text"))
+            if refreshed != (existing.get("draft") or {}):
+                _persist_wizard_draft(context, existing["id"], refreshed)
+                existing = get_active_campaign_wizard(context)
         return existing
 
     draft = dict(initial or {})
+    if WIZARD_SIMPLE_MODE_ENABLED:
+        draft = apply_smart_wizard_defaults(context, draft, user_text=context.get("_current_user_text"))
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -8022,7 +8366,11 @@ def start_campaign_wizard(context, initial=None):
                 ),
             )
             wizard_id = cursor.fetchone()["id"]
-    log_activity(context, "campaign_wizard_started", {"wizard_id": wizard_id})
+    log_activity(context, "campaign_wizard_started", {
+        "wizard_id": wizard_id,
+        "simple_mode": WIZARD_SIMPLE_MODE_ENABLED,
+        "reused_active_setup": bool((draft.get("_smart_defaults") or {}).get("reference_found")),
+    })
     return get_active_campaign_wizard(context)
 
 
@@ -8037,19 +8385,13 @@ def update_campaign_wizard(context, updates):
             "wizard": wizard,
         }
     draft = deep_merge_dict(wizard.get("draft") or {}, updates or {})
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE campaign_wizards
-                SET draft=%s::jsonb, updated_at=NOW()
-                WHERE id=%s AND company_id=%s AND user_id=%s;
-                """,
-                (
-                    json.dumps(draft, ensure_ascii=False, default=str),
-                    wizard["id"], context["company_id"], context["user_id"],
-                ),
-            )
+    if WIZARD_SIMPLE_MODE_ENABLED:
+        draft = apply_smart_wizard_defaults(context, draft, user_text=context.get("_current_user_text"))
+    _persist_wizard_draft(context, wizard["id"], draft)
+    log_activity(context, "campaign_wizard_updated", {
+        "wizard_id": wizard["id"],
+        "simple_step": wizard_simple_progress(draft, wizard.get("assets") or []).get("step"),
+    })
     return get_active_campaign_wizard(context)
 
 
@@ -8104,37 +8446,41 @@ def campaign_wizard_missing(draft, assets=None):
     assets = assets or []
     missing = []
 
-    if not str(campaign.get("name") or "").strip():
-        missing.append("nome da campanha")
+    # V11.3: nomes, categoria padrão, Página/Pixel e configuração técnica são
+    # preenchidos automaticamente quando a conta oferece uma referência segura.
+    if not str(campaign.get("business_goal") or "").strip():
+        missing.append("ETAPA 1 — diga o que quer anunciar e qual resultado espera")
     if not str(campaign.get("objective") or "").strip():
-        missing.append("objetivo principal")
+        missing.append("AUTO — definir objetivo técnico compatível com o resultado desejado")
+    if not str(campaign.get("name") or "").strip():
+        missing.append("AUTO — gerar nome da campanha")
     if "special_ad_categories" not in campaign:
-        missing.append("categoria especial (imóveis/habitação, crédito, emprego, política ou nenhuma)")
+        missing.append("AUTO — validar categoria especial pela oferta")
+
     if not str(adset.get("name") or "").strip():
-        missing.append("nome do conjunto de anúncios")
+        missing.append("AUTO — gerar nome do conjunto")
     if adset.get("daily_budget_major") is None and adset.get("lifetime_budget_major") is None:
-        missing.append("orçamento")
+        missing.append("ETAPA 2 — informe quanto quer investir por dia ou no total")
     if not adset.get("targeting"):
-        missing.append("público/segmentação")
+        missing.append("ETAPA 2 — informe cidade/região ou público; se houver referência na conta, posso reutilizá-lo")
     if not str(adset.get("optimization_goal") or "").strip():
-        missing.append("otimização do conjunto")
+        missing.append("AUTO — definir otimização do conjunto")
     if not str(adset.get("billing_event") or "").strip():
-        missing.append("forma de cobrança")
+        missing.append("AUTO — definir cobrança do conjunto")
+
     existing_creatives = list(draft.get("existing_creative_ids") or [])
     if assets and not str(creative.get("page_id") or "").strip():
-        missing.append("Página do Facebook/identidade do anúncio")
-
+        missing.append("AUTO — identificar a Página/identidade usada pela conta; só perguntar se houver ambiguidade real")
     if not assets and not existing_creatives:
-        missing.append("pelo menos um criativo (imagem/vídeo ou creative_id existente)")
+        missing.append("ETAPA 3 — envie uma imagem ou vídeo do anúncio")
 
-    # Para criativos novos em formato de link, precisamos de destino e texto.
     if assets:
         if not str(creative.get("destination_url") or "").strip():
-            missing.append("link/destino do anúncio")
+            missing.append("ETAPA 3 — informe o link de destino quando o anúncio usar link")
         if not str(creative.get("primary_text") or "").strip():
-            missing.append("texto principal do anúncio")
+            missing.append("AUTO — escrever texto principal a partir da oferta")
         if not str(creative.get("headline") or "").strip():
-            missing.append("título do anúncio")
+            missing.append("AUTO — escrever título a partir da oferta")
 
     return missing
 
@@ -8280,9 +8626,8 @@ def process_wizard_media_message(sender, user_id, media_id, media_type, caption=
             sender,
             (
                 f"✅ {media_type.upper()} ADICIONADO À CAMPANHA\n\n"
-                f"O criativo foi preparado para uso no anúncio. Agora faltam: "
-                f"{', '.join(wizard.get('missing') or []) if wizard.get('missing') else 'nenhuma informação obrigatória'}.\n\n"
-                "Pode continuar me dizendo, por texto ou áudio, como quer montar a campanha."
+                f"O criativo foi preparado para uso no anúncio.\n\n"
+                f"Próximo passo: {(wizard.get('simple_flow') or {}).get('ask') or 'já posso montar o resumo para sua revisão'}."
             ),
         )
     except Exception as error:
@@ -8414,6 +8759,15 @@ def campaign_wizard_summary(context, wizard):
             "assets": len(assets),
             "existing_creatives": len(draft.get("existing_creative_ids") or []),
         },
+        "automation": {
+            "reference_campaign": (draft.get("_smart_defaults") or {}).get("reference_campaign_name"),
+            "reference_adset": (draft.get("_smart_defaults") or {}).get("reference_adset_name"),
+            "pixel_reused": bool((draft.get("_smart_defaults") or {}).get("pixel_reused")),
+            "page_reused": bool((draft.get("_smart_defaults") or {}).get("page_reused")),
+            "targeting_reused": bool((draft.get("_smart_defaults") or {}).get("targeting_reused")),
+            "reused_fields": list((draft.get("_smart_defaults") or {}).get("reused_fields") or []),
+        },
+        "simple_flow": wizard_simple_progress(draft, assets),
         "missing": campaign_wizard_missing(draft, assets),
     }
 
@@ -8424,12 +8778,27 @@ def prepare_campaign_wizard_confirmation(context):
         return {"ready": False, "reason": "Nenhuma campanha em montagem."}
     if wizard["status"] == "WAITING_CREATION_CONFIRMATION":
         return {"ready": True, "summary": campaign_wizard_summary(context, wizard), "confirmation": "Pode criar"}
+
+    if WIZARD_SIMPLE_MODE_ENABLED and wizard.get("status") == "DRAFT":
+        refreshed = apply_smart_wizard_defaults(context, wizard.get("draft") or {}, user_text=context.get("_current_user_text"))
+        if refreshed != (wizard.get("draft") or {}):
+            _persist_wizard_draft(context, wizard["id"], refreshed)
+            wizard = get_active_campaign_wizard(context)
+
     summary = campaign_wizard_summary(context, wizard)
     if summary["missing"]:
+        user_missing = [x for x in summary["missing"] if not str(x).startswith("AUTO —")]
+        auto_missing = [x for x in summary["missing"] if str(x).startswith("AUTO —")]
         return {
             "ready": False,
             "missing": summary["missing"],
-            "instruction": "Pergunte apenas o próximo bloco lógico de informações faltantes, em linguagem simples.",
+            "user_missing": user_missing,
+            "auto_missing": auto_missing,
+            "simple_flow": wizard.get("simple_flow"),
+            "instruction": (
+                "Não peça termos técnicos ao cliente. Resolva itens AUTO usando a configuração real da conta/Meta. "
+                "Se ainda faltar informação humana, faça somente a pergunta indicada em simple_flow."
+            ),
         }
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
@@ -8443,9 +8812,12 @@ def prepare_campaign_wizard_confirmation(context):
         "summary": campaign_wizard_summary(context, wizard),
         "mandatory_message": (
             "📋 RESUMO DA CAMPANHA\n\n"
-            "Revise campanha, conjunto e anúncios antes da criação.\n\n"
+            "Mostre só 3 blocos: CAMPANHA, CONJUNTO e ANÚNCIO. "
+            "Não exponha IDs técnicos, billing_event, optimization_goal ou JSON.\n\n"
+            "Informe em uma linha quais configurações puderam ser reaproveitadas automaticamente da conta "
+            "(ex.: público, Pixel e Página).\n\n"
             "A estrutura será criada PAUSADA e não haverá gasto neste momento.\n\n"
-            "Se estiver tudo certo, responda: Pode criar."
+            "Se estiver tudo certo, peça: Pode criar."
         ),
     }
 
@@ -8633,7 +9005,7 @@ ACTION_AI_TOOLS = [
     {
         "type": "function",
         "name": "iniciar_wizard_campanha",
-        "description": "Inicia ou retorna o Campaign Creation Wizard persistente. Use quando o cliente disser que quer criar/montar uma campanha.",
+        "description": "Inicia/retorna o wizard simples. O backend tenta reaproveitar automaticamente setup técnico de campanha ativa (público, Pixel, Página, otimização etc.) para não perguntar termos técnicos ao leigo.",
         "parameters": {
             "type": "object",
             "properties": {"initial": {"type": ["object", "null"], "additionalProperties": True}},
@@ -8643,7 +9015,7 @@ ACTION_AI_TOOLS = [
     {
         "type": "function",
         "name": "atualizar_wizard_campanha",
-        "description": "Salva no rascunho do wizard informações que o cliente já forneceu em linguagem natural ou áudio.",
+        "description": "Salva de uma vez tudo que já puder ser extraído da mensagem do cliente. Não divida em uma pergunta por campo; o backend mantém defaults técnicos reaproveitados da conta.",
         "parameters": {
             "type": "object",
             "properties": {"updates": {"type": "object", "additionalProperties": True}},
@@ -8865,11 +9237,32 @@ Procure causa principal, magnitude, evidências, hipóteses alternativas e plano
 Se recomendar uma ação suportada, pode deixá-la pendente para confirmação, mas nunca execute sem autorização.
 """.strip(),
     "wizard": """
-ROTA: CAMPAIGN WIZARD
-Conduza criação em blocos: objetivo/nome -> categoria especial -> orçamento/período -> público -> destino/Pixel/evento -> Página -> criativos/copy -> revisão.
-Pergunte apenas o próximo bloco necessário. Salve informações com atualizar_wizard_campanha.
-Para localização/interesse use buscas Meta; para Pixel/Página liste ativos reais. Não invente informação crítica.
-Antes de criar use preparar_confirmacao_wizard. Só crie após confirmação explícita. Tudo nasce PAUSED; ativação é outra confirmação.
+ROTA: CAMPAIGN WIZARD SIMPLES PARA LEIGOS
+O cliente NÃO conhece Meta Ads. O fluxo visível deve ter no máximo 3 blocos e você deve esconder a complexidade técnica:
+
+1) CAMPANHA
+- Pergunte somente o que ele quer anunciar e qual resultado de negócio espera, se isso ainda não estiver claro.
+- Gere sozinho nome da campanha e do conjunto. Não pergunte nomes técnicos.
+- Traduza a intenção para objective técnico. Se a oferta claramente exigir categoria especial, configure-a; só pergunte em linguagem comum se houver ambiguidade real.
+
+2) CONJUNTO
+- Pergunte orçamento em reais. Se o backend já reutilizou targeting, Pixel/promoted_object, otimização, cobrança, atribuição ou destino de uma estrutura ativa compatível, NÃO pergunte isso ao cliente.
+- Se não houver público reutilizável, pergunte somente cidade/região ou descreva o público em linguagem comum; use buscar_localizacoes_meta/buscar_interesses_meta para transformar isso em IDs.
+- Nunca pergunte optimization_goal, billing_event, promoted_object, attribution_spec, bid_strategy, pixel_id ou qualquer ID técnico.
+
+3) ANÚNCIO
+- Peça imagem ou vídeo. Se for anúncio com link e o link ainda não existir, peça o link.
+- Se o cliente não escrever copy/headline, escreva você com base na oferta e salve no wizard; não crie etapas extras só para copy.
+- Reutilize automaticamente a Página/identidade já detectada pela conta. Só mostre opções de Página se realmente houver ambiguidade.
+
+REGRAS DE FLUXO
+- Ao iniciar, use iniciar_wizard_campanha: o backend tenta reaproveitar uma campanha/conjunto ativo como referência técnica, inclusive Pixel, público e Página quando disponíveis.
+- Itens de missing que começam com 'AUTO —' são responsabilidade SUA/backend. Não pergunte esses termos ao cliente.
+- Use atualizar_wizard_campanha para salvar todas as informações que já puder extrair de uma única mensagem, evitando uma pergunta por campo.
+- Se o objetivo declarado pelo cliente for claramente incompatível com a referência automática, use listar_estrutura_meta uma vez para entender os setups reais da conta e ajuste o wizard; não force uma referência errada.
+- Sempre faça somente a pergunta indicada em simple_flow quando ainda faltar dado humano.
+- Quando estiver completo, use preparar_confirmacao_wizard e mostre apenas: CAMPANHA, CONJUNTO e ANÚNCIO + uma linha 'Configurações reaproveitadas automaticamente'.
+- Só crie após confirmação explícita. Tudo nasce PAUSED; ativação continua sendo uma segunda confirmação.
 """.strip(),
 }
 
@@ -9160,6 +9553,7 @@ def v10_capabilities():
 @app.route("/v11-capabilities", methods=["GET"])
 @app.route("/v111-capabilities", methods=["GET"])
 @app.route("/v112-capabilities", methods=["GET"])
+@app.route("/v113-capabilities", methods=["GET"])
 def v11_capabilities():
     return {
         "build_id": BUILD_ID,
@@ -9187,6 +9581,15 @@ def v11_capabilities():
         "native_rollback": True,
         "writes_require_confirmation": True,
         "campaign_wizard": CAMPAIGN_WIZARD_ENABLED,
+        "simple_campaign_wizard": WIZARD_SIMPLE_MODE_ENABLED,
+        "wizard_visible_steps": 3,
+        "wizard_reuse_active_setup": WIZARD_REUSE_ACTIVE_SETUP,
+        "wizard_auto_reuse_pixel": True,
+        "wizard_auto_reuse_targeting": True,
+        "wizard_auto_reuse_page": True,
+        "wizard_auto_names": True,
+        "wizard_auto_copy_fallback": True,
+        "wizard_hides_technical_fields_from_lay_user": True,
     }, 200
 
 
