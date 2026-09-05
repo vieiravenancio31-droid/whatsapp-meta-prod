@@ -31,7 +31,7 @@ from psycopg.rows import dict_row
 
 app = Flask(__name__)
 
-BUILD_ID = "v10.4-phone-identity-permission-fix-2026-09-04"
+BUILD_ID = "v10.6-permission-memory-decoupled-2026-09-04"
 ANALYSIS_ENGINE = "meta_driven_v9_1_action_ai_v10_2"
 OBJECTIVE_MAPPING_HARDCODED = False
 print("BOOT BUILD_ID:", BUILD_ID)
@@ -704,6 +704,43 @@ def get_user_context(whatsapp_number):
     return row
 
 
+def refresh_context_permissions(context):
+    """Recarrega permissões diretamente do PostgreSQL antes de qualquer escrita.
+
+    Evita que uma análise longa ou um contexto já criado continue usando flags antigas
+    depois que o administrador altera as permissões do cliente.
+    """
+    if not context or not context.get("user_id"):
+        return context
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    u.can_read_ads,
+                    u.can_manage_ads,
+                    u.can_create_campaigns,
+                    u.active AS user_active,
+                    c.active AS company_active
+                FROM users u
+                JOIN companies c ON c.id = u.company_id
+                WHERE u.id = %s
+                LIMIT 1;
+                """,
+                (context["user_id"],),
+            )
+            row = cursor.fetchone()
+
+    if not row or not row.get("user_active") or not row.get("company_active"):
+        raise PermissionError("Este acesso está bloqueado ou inativo na plataforma.")
+
+    context["can_read_ads"] = bool(row.get("can_read_ads"))
+    context["can_manage_ads"] = bool(row.get("can_manage_ads"))
+    context["can_create_campaigns"] = bool(row.get("can_create_campaigns"))
+    return context
+
+
 def log_activity(context, action, details=None):
     try:
         initialize_database()
@@ -920,6 +957,13 @@ def update_client_permissions(whatsapp_number, can_read_ads, can_manage_ads, can
     result = dict(row)
     result["requested_number"] = exact
     result["matched_by_alias"] = (result.get("whatsapp_number") != exact)
+
+    # V10.6: permissões e memória conversacional são independentes.
+    # Alterar leitura/gestão/criação NÃO apaga o previous_response_id da OpenAI.
+    # O histórico do cliente é preservado; a autorização atual vem do PostgreSQL
+    # e é revalidada pelo backend antes de qualquer escrita na Meta.
+    result["conversation_memory_preserved"] = True
+
     return result, None
 
 
@@ -3797,7 +3841,8 @@ def receive_webhook():
                     + (f"Número informado: {updated.get('requested_number')}\n" if updated.get('matched_by_alias') else "")
                     + f"Consulta Ads: {'SIM' if updated['can_read_ads'] else 'NÃO'}\n"
                     + f"Gerencia Ads: {'SIM' if updated['can_manage_ads'] else 'NÃO'}\n"
-                    + f"Cria campanhas: {'SIM' if updated['can_create_campaigns'] else 'NÃO'}"
+                    + f"Cria campanhas: {'SIM' if updated['can_create_campaigns'] else 'NÃO'}\n\n"
+                    + "Memória da conversa: PRESERVADA"
                 ),
             )
             return "EVENT_RECEIVED", 200
@@ -5389,6 +5434,7 @@ def compute_new_budget(current, mode, amount):
 
 
 def propose_budget_change(context, mode, amount_major, campaign_ids=None, search=None, active_only=True):
+    refresh_context_permissions(context)
     if not context.get("can_manage_ads"):
         raise PermissionError(
             "Este usuário pode consultar a Meta, mas o gerenciamento está desativado na plataforma. "
@@ -5544,6 +5590,7 @@ def action_summary(action_type, target_type, target_id, spec, summary=None):
 
 
 def validate_action_request(context, action_type, target_type=None, target_id=None, spec=None):
+    refresh_context_permissions(context)
     spec = dict(spec or {})
     if not ACTION_AI_ENABLED:
         raise RuntimeError("Action AI está desativitado no ambiente.")
@@ -5917,6 +5964,7 @@ def register_ad_review_watch(context, campaign_id, adset_id, ad_id, ad_name):
 
 
 def create_paused_structure(context, campaign, adset=None, ads=None):
+    refresh_context_permissions(context)
     if not ACTION_AI_ENABLED:
         raise RuntimeError("Action AI está desativado.")
     if not context.get("can_create_campaigns"):
@@ -6347,6 +6395,7 @@ def get_active_campaign_wizard(context):
 
 
 def start_campaign_wizard(context, initial=None):
+    refresh_context_permissions(context)
     if not CAMPAIGN_WIZARD_ENABLED:
         raise RuntimeError("Campaign Wizard está desativado.")
     if not context.get("can_create_campaigns"):
@@ -7172,7 +7221,16 @@ Você conversa com pessoas leigas. Elas não devem precisar abrir o Gerenciador 
 Empresa: {context.get('company_name')}.
 Conta Meta: {context.get('ad_account_id') or 'nenhuma'}.
 Data atual na timezone da conta: {today.isoformat()}.
+Permissões internas ATUAIS deste WhatsApp: leitura={bool(context.get('can_read_ads'))}, gerenciamento={bool(context.get('can_manage_ads'))}, criação={bool(context.get('can_create_campaigns'))}.
 Estado do Campaign Wizard: {json.dumps(context.get("_campaign_wizard"), ensure_ascii=False, default=str) if context.get("_campaign_wizard") else "nenhum wizard ativo"}.
+
+REGRA DE ATUALIZAÇÃO DE PERMISSÕES E MEMÓRIA
+- Preserve o histórico e o contexto da conversa do cliente; uma mudança de permissão NÃO significa perda de memória.
+- As permissões acima são a fotografia atual do PostgreSQL para ESTE turno e prevalecem sobre qualquer afirmação antiga da conversa sobre acesso.
+- Mensagens antigas continuam válidas como contexto estratégico, mas NÃO são fonte de verdade para autorização.
+- Nunca recuse uma ação apenas porque em uma mensagem anterior o sistema disse que a permissão estava bloqueada.
+- Quando o usuário pedir orçamento, pausa, reativação ou outra alteração suportada, chame a ferramenta correspondente e deixe o backend revalidar a permissão em tempo real.
+- Para criação de campanha, o backend também revalida can_create_campaigns em tempo real.
 
 MISSÃO
 1. Entender o que o cliente quer, seja texto ou uma transcrição de áudio.
@@ -7414,6 +7472,7 @@ def execute_dynamic_tool(context, tool_name, arguments):
         )
 
     if tool_name == "diagnosticar_permissoes_meta":
+        refresh_context_permissions(context)
         meta_status = meta_permission_status(context)
         return {
             "platform": {
@@ -7507,6 +7566,8 @@ def v91_capabilities():
 @app.route("/v10-capabilities", methods=["GET"])
 @app.route("/v102-capabilities", methods=["GET"])
 @app.route("/v103-capabilities", methods=["GET"])
+@app.route("/v105-capabilities", methods=["GET"])
+@app.route("/v106-capabilities", methods=["GET"])
 def v10_capabilities():
     return {
         "build_id": BUILD_ID,
@@ -7522,6 +7583,11 @@ def v10_capabilities():
         "separate_manage_permission": True,
         "phone_identity_alias_resolution": True,
         "permission_update_by_user_id_after_match": True,
+        "permission_refresh_before_every_write": True,
+        "conversation_reset_after_permission_change": False,
+        "conversation_memory_preserved_on_permission_change": True,
+        "permissions_and_memory_decoupled": True,
+        "current_permissions_injected_into_ai_prompt": True,
         "meta_ads_management_check": True,
         "budget_intelligence": True,
         "new_structures_forced_paused": True,
