@@ -2,6 +2,9 @@ import os
 import re
 import json
 import uuid
+import io
+import time
+import mimetypes
 import base64
 import hashlib
 import hmac
@@ -27,9 +30,25 @@ from psycopg.rows import dict_row
 
 app = Flask(__name__)
 
-BUILD_ID = "dynamic-analysis-v3-2026-08-27"
+BUILD_ID = "v10-action-ai-2026-09-04"
+ANALYSIS_ENGINE = "meta_driven_v9_1_action_ai_v10"
+OBJECTIVE_MAPPING_HARDCODED = False
 print("BOOT BUILD_ID:", BUILD_ID)
+print("BOOT ANALYSIS_ENGINE:", ANALYSIS_ENGINE)
 
+
+# =========================================================
+# V9.1 — META-DRIVEN ANALYSIS
+# =========================================================
+# Esta versão NÃO possui tabela fixa objective -> KPI.
+# Em tempo de execução, ela consulta a Meta para obter:
+# - campaign.objective
+# - adset.optimization_goal / optimization_sub_event
+# - billing_event / promoted_object / destination_type
+# - objective_results / cost_per_objective_result / cost_per_result quando disponíveis
+# - actions / cost_per_action_type / action_values como fallback de evidência
+# A OpenAI interpreta o setup real e, quando escolhe um action_type,
+# o backend valida esse evento contra os Insights antes da conclusão.
 
 # =========================================================
 # VARIÁVEIS DE AMBIENTE
@@ -53,6 +72,30 @@ TOKEN_ENCRYPTION_KEY = os.getenv("TOKEN_ENCRYPTION_KEY")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
+
+# O motor dinâmico pode usar um modelo mais forte sem alterar o modelo legado.
+# Para custo/qualidade, Terra é o padrão da v8; pode ser sobrescrito no Railway.
+OPENAI_ANALYSIS_MODEL = os.getenv("OPENAI_ANALYSIS_MODEL", "gpt-5.6-terra")
+OPENAI_ANALYSIS_REASONING_EFFORT = os.getenv(
+    "OPENAI_ANALYSIS_REASONING_EFFORT",
+    "medium",
+).strip().lower()
+if OPENAI_ANALYSIS_REASONING_EFFORT not in {
+    "none", "low", "medium", "high", "xhigh", "max"
+}:
+    OPENAI_ANALYSIS_REASONING_EFFORT = "medium"
+
+# V10 — áudio e Action AI
+OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe")
+ACTION_AI_ENABLED = os.getenv("ACTION_AI_ENABLED", "true").strip().lower() in {"1", "true", "yes", "sim"}
+REVIEW_WATCH_ENABLED = os.getenv("REVIEW_WATCH_ENABLED", "true").strip().lower() in {"1", "true", "yes", "sim"}
+try:
+    REVIEW_WATCH_INTERVAL_SECONDS = max(60, int(os.getenv("REVIEW_WATCH_INTERVAL_SECONDS", "300")))
+except ValueError:
+    REVIEW_WATCH_INTERVAL_SECONDS = 300
+WHATSAPP_REVIEW_APPROVED_TEMPLATE = os.getenv("WHATSAPP_REVIEW_APPROVED_TEMPLATE")
+WHATSAPP_REVIEW_REJECTED_TEMPLATE = os.getenv("WHATSAPP_REVIEW_REJECTED_TEMPLATE")
+WHATSAPP_TEMPLATE_LANGUAGE = os.getenv("WHATSAPP_TEMPLATE_LANGUAGE", "pt_BR")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_WHATSAPP_NUMBER = os.getenv("ADMIN_WHATSAPP_NUMBER")
@@ -79,6 +122,8 @@ database_lock = threading.Lock()
 # do mesmo usuário. Em escala horizontal, migrar para lock distribuído.
 active_analysis_users = set()
 active_analysis_lock = threading.Lock()
+review_watcher_started = False
+review_watcher_lock = threading.Lock()
 
 
 # =========================================================
@@ -312,6 +357,96 @@ def initialize_database():
                     """
                 )
 
+                # V10 — estado operacional, idempotência e auditoria de ações.
+                cursor.execute(
+                    """
+                    ALTER TABLE users
+                    ADD COLUMN IF NOT EXISTS last_inbound_at TIMESTAMPTZ;
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS inbound_messages (
+                        message_id TEXT PRIMARY KEY,
+                        company_id BIGINT REFERENCES companies(id) ON DELETE SET NULL,
+                        user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+                        whatsapp_number TEXT,
+                        message_type TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS pending_actions (
+                        id BIGSERIAL PRIMARY KEY,
+                        action_key TEXT NOT NULL UNIQUE,
+                        company_id BIGINT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+                        user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        ad_account_id TEXT NOT NULL,
+                        action_type TEXT NOT NULL,
+                        target_type TEXT,
+                        target_id TEXT,
+                        spec JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        summary TEXT,
+                        status TEXT NOT NULL DEFAULT 'PENDING_CONFIRMATION',
+                        requires_confirmation BOOLEAN NOT NULL DEFAULT TRUE,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        confirmed_at TIMESTAMPTZ,
+                        executed_at TIMESTAMPTZ,
+                        result JSONB,
+                        error TEXT
+                    );
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_pending_actions_user_status
+                    ON pending_actions(user_id, status, created_at DESC);
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ad_review_watch (
+                        id BIGSERIAL PRIMARY KEY,
+                        company_id BIGINT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+                        user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+                        whatsapp_number TEXT NOT NULL,
+                        ad_account_id TEXT NOT NULL,
+                        campaign_id TEXT,
+                        adset_id TEXT,
+                        ad_id TEXT NOT NULL,
+                        ad_name TEXT,
+                        last_effective_status TEXT,
+                        last_review_feedback JSONB,
+                        last_issues_info JSONB,
+                        notified_state TEXT,
+                        active BOOLEAN NOT NULL DEFAULT TRUE,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        UNIQUE(company_id, ad_id)
+                    );
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS pending_notifications (
+                        id BIGSERIAL PRIMARY KEY,
+                        company_id BIGINT REFERENCES companies(id) ON DELETE CASCADE,
+                        user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+                        whatsapp_number TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        body TEXT NOT NULL,
+                        delivered_at TIMESTAMPTZ,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+
                 # Empresa principal.
                 cursor.execute(
                     """
@@ -384,6 +519,7 @@ def initialize_database():
 
         database_initialized = True
         print("PostgreSQL inicializado com sucesso.")
+        ensure_review_watcher_started()
 
 
 # =========================================================
@@ -412,7 +548,8 @@ def get_user_context(whatsapp_number):
                     m.ad_account_id,
                     m.name AS meta_account_name,
                     m.connection_id,
-                    m.timezone_name AS meta_timezone_name
+                    m.timezone_name AS meta_timezone_name,
+                    m.currency AS meta_currency
                 FROM users u
                 INNER JOIN companies c
                     ON c.id = u.company_id
@@ -1056,6 +1193,35 @@ def home():
         "architecture": "multi_company_oauth_v1",
         "build_id": BUILD_ID,
         "dynamic_analysis": "enabled",
+        "analysis_engine": ANALYSIS_ENGINE,
+        "objective_aware": "meta_driven",
+        "analysis_model": OPENAI_ANALYSIS_MODEL,
+        "analysis_reasoning_effort": OPENAI_ANALYSIS_REASONING_EFFORT,
+        "action_ai": "enabled" if ACTION_AI_ENABLED else "disabled",
+        "audio_input": "enabled",
+        "review_watcher": "enabled" if REVIEW_WATCH_ENABLED else "disabled",
+        "transcribe_model": OPENAI_TRANSCRIBE_MODEL,
+    }, 200
+
+
+@app.route("/format-test", methods=["GET"])
+def format_test():
+    raw = """### **📊 RESUMO**
+**Investimento:** R$ 12.450
+**Leads:** 184
+**CPL:** R$ 67,66
+
+## ✅ PONTOS POSITIVOS
+- A campanha **Imersão** melhorou.
+
+### ⚠️ PONTOS DE ATENÇÃO
+* A campanha Sul concentrou gasto.
+
+### 🎯 PRÓXIMA AÇÃO
+Investigue os anúncios da campanha Sul."""
+    return {
+        "build_id": BUILD_ID,
+        "formatted": clean_ai_text_for_whatsapp(raw),
     }, 200
 
 
@@ -1303,7 +1469,177 @@ def send_whatsapp_message(to, text):
     return response
 
 
+def clean_ai_text_for_whatsapp(text):
+    """
+    Formata respostas analíticas para WhatsApp de forma DETERMINÍSTICA.
+
+    Regra desta versão:
+    - nenhum #;
+    - nenhum *;
+    - nenhum **;
+    - nenhum bloco de código;
+    - nenhuma tabela Markdown;
+    - títulos com emoji + MAIÚSCULAS;
+    - listas com •;
+    - espaçamento curto e consistente.
+
+    Assim, a apresentação final não depende da OpenAI obedecer ao prompt.
+    """
+    text = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return ""
+
+    # Remove cercas e links Markdown, preservando o conteúdo útil.
+    text = re.sub(r"```(?:[a-zA-Z0-9_+.-]+)?\s*", "", text)
+    text = text.replace("```", "")
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1: \2", text)
+
+    section_emojis = {
+        "resumo": "📊",
+        "visao geral": "📊",
+        "resultado": "📊",
+        "resultados": "📊",
+        "comparacao": "📊",
+        "comparativo": "📊",
+        "metricas": "📈",
+        "principais metricas": "📈",
+        "pontos positivos": "✅",
+        "ponto positivo": "✅",
+        "melhor sinal": "✅",
+        "destaques positivos": "✅",
+        "o que melhorou": "✅",
+        "pontos de atencao": "⚠️",
+        "ponto de atencao": "⚠️",
+        "atencao": "⚠️",
+        "alerta": "⚠️",
+        "alertas": "⚠️",
+        "problemas": "⚠️",
+        "riscos": "⚠️",
+        "o que piorou": "⚠️",
+        "proxima acao": "🎯",
+        "proximas acoes": "🎯",
+        "recomendacao": "🎯",
+        "recomendacoes": "🎯",
+        "o que fazer": "🎯",
+        "prioridade": "🎯",
+        "prioridades": "🎯",
+        "campanhas": "📣",
+        "anuncios": "🧩",
+        "conjuntos": "🧩",
+        "conjuntos de anuncios": "🧩",
+        "conclusao": "🧠",
+        "diagnostico": "🧠",
+    }
+
+    def strip_markup(value):
+        value = value.strip()
+        value = re.sub(r"^>+\s*", "", value)
+        value = re.sub(r"^#{1,6}\s*", "", value)
+        value = re.sub(r"\s*#+$", "", value)
+        value = value.replace("**", "")
+        value = value.replace("__", "")
+        value = value.replace("~~", "")
+        value = value.replace("`", "")
+        value = value.replace("*", "")
+        # Remove apenas underscores usados como ênfase; não mexe em URLs/IDs inteiros.
+        value = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"\1", value)
+        value = re.sub(r"[ \t]{2,}", " ", value)
+        return value.strip()
+
+    def normalize_key(value):
+        value = strip_markup(value)
+        value = re.sub(r"^[^\wÀ-ÿ]+", "", value)
+        value = re.sub(r"[^\wÀ-ÿ]+$", "", value)
+        normalized = unicodedata.normalize("NFD", value.lower())
+        normalized = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+        return re.sub(r"\s+", " ", normalized).strip()
+
+    def split_emoji(value):
+        match = re.match(r"^([\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0F]+)\s*", value)
+        if not match:
+            return None, value
+        return match.group(1).strip(), value[match.end():].strip()
+
+    lines = []
+    for raw in text.split("\n"):
+        raw = raw.strip()
+        if not raw:
+            lines.append("")
+            continue
+
+        # Descarta separadores e linha de separação de tabela Markdown.
+        if re.fullmatch(r"[-*_~| ]{3,}", raw):
+            continue
+        if re.fullmatch(r"\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?", raw):
+            continue
+
+        # Tabelas simples viram texto legível.
+        if "|" in raw:
+            cells = [strip_markup(c) for c in raw.strip("|").split("|")]
+            cells = [c for c in cells if c]
+            if len(cells) == 2:
+                raw = f"{cells[0]}: {cells[1]}"
+            elif len(cells) > 2:
+                raw = " • ".join(cells)
+
+        # Lista Markdown/numerada -> bullet único.
+        if re.match(r"^(?:[-+*•·]|\d+[.)])\s+", raw):
+            body = re.sub(r"^(?:[-+*•·]|\d+[.)])\s+", "", raw)
+            body = strip_markup(body)
+            if body:
+                lines.append(f"• {body}")
+            continue
+
+        was_heading = bool(re.match(r"^#{1,6}\s*", raw))
+        cleaned = strip_markup(raw)
+        if not cleaned:
+            continue
+
+        existing_emoji, title_candidate = split_emoji(cleaned)
+        title_candidate = title_candidate.rstrip(":").strip()
+        key = normalize_key(title_candidate)
+        is_upper_heading = (
+            len(title_candidate) <= 60
+            and len(title_candidate.split()) <= 8
+            and any(ch.isalpha() for ch in title_candidate)
+            and title_candidate.upper() == title_candidate
+        )
+        is_known_heading = key in section_emojis
+
+        if was_heading or is_known_heading or (existing_emoji and is_upper_heading):
+            emoji = existing_emoji or section_emojis.get(key, "")
+            title = title_candidate.upper()
+            lines.append(f"{emoji + ' ' if emoji else ''}{title}")
+            continue
+
+        cleaned = re.sub(r"^[•·]\s*", "", cleaned)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+        if cleaned:
+            lines.append(cleaned)
+
+    # Colapsa linhas vazias duplicadas.
+    compact = []
+    previous_blank = False
+    for line in lines:
+        blank = not line.strip()
+        if blank and previous_blank:
+            continue
+        compact.append(line)
+        previous_blank = blank
+
+    result = "\n".join(compact).strip()
+
+    # Trava final: a resposta analítica enviada ao WhatsApp não pode conter
+    # os marcadores que estavam poluindo a mensagem.
+    result = result.replace("#", "")
+    result = result.replace("*", "")
+    result = result.replace("```", "")
+    result = re.sub(r"\n{3,}", "\n\n", result)
+
+    return result.strip()
+
 def send_whatsapp_long_message(to, text, max_chars=3500):
+    text = clean_ai_text_for_whatsapp(text)
     text = str(text or "").strip()
     if not text:
         return []
@@ -1326,6 +1662,226 @@ def send_whatsapp_long_message(to, text, max_chars=3500):
         responses.append(send_whatsapp_message(to, chunk))
     return responses
 
+
+
+# =========================================================
+# V10 — WHATSAPP ÁUDIO / IDPOTÊNCIA / NOTIFICAÇÕES
+# =========================================================
+
+def register_inbound_message(context, message_id, message_type, whatsapp_number):
+    """Retorna True somente na primeira vez que o webhook processa este message_id."""
+    if not message_id:
+        return True
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO inbound_messages (
+                        message_id, company_id, user_id, whatsapp_number, message_type
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (message_id) DO NOTHING
+                    RETURNING message_id;
+                    """,
+                    (
+                        message_id,
+                        context.get("company_id") if context else None,
+                        context.get("user_id") if context else None,
+                        whatsapp_number,
+                        message_type,
+                    ),
+                )
+                return cursor.fetchone() is not None
+    except Exception as error:
+        print("[V10] INBOUND_IDEMPOTENCY_ERROR", repr(error))
+        # Falhar aberto aqui evita perder uma mensagem legítima por erro de auditoria.
+        return True
+
+
+def touch_last_inbound(context):
+    if not context:
+        return
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE users SET last_inbound_at = NOW() WHERE id = %s;",
+                    (context["user_id"],),
+                )
+    except Exception as error:
+        print("[V10] LAST_INBOUND_ERROR", repr(error))
+
+
+def send_whatsapp_template(to, template_name, language_code=None):
+    if not template_name:
+        return None
+    url = (
+        f"https://graph.facebook.com/{GRAPH_API_VERSION}/"
+        f"{PHONE_NUMBER_ID}/messages"
+    )
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to,
+        "type": "template",
+        "template": {
+            "name": template_name,
+            "language": {"code": language_code or WHATSAPP_TEMPLATE_LANGUAGE},
+        },
+    }
+    response = requests.post(url, headers=headers, json=payload, timeout=30)
+    print("[V10] WHATSAPP_TEMPLATE:", response.status_code, response.text)
+    return response
+
+
+def queue_pending_notification(context, whatsapp_number, kind, body):
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO pending_notifications (
+                        company_id, user_id, whatsapp_number, kind, body
+                    ) VALUES (%s, %s, %s, %s, %s);
+                    """,
+                    (
+                        context.get("company_id") if context else None,
+                        context.get("user_id") if context else None,
+                        whatsapp_number,
+                        kind,
+                        body,
+                    ),
+                )
+    except Exception as error:
+        print("[V10] PENDING_NOTIFICATION_ERROR", repr(error))
+
+
+def deliver_pending_notifications(context, whatsapp_number):
+    if not context:
+        return
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, body
+                    FROM pending_notifications
+                    WHERE user_id = %s AND delivered_at IS NULL
+                    ORDER BY id ASC
+                    LIMIT 10;
+                    """,
+                    (context["user_id"],),
+                )
+                rows = cursor.fetchall()
+                for row in rows:
+                    response = send_whatsapp_message(whatsapp_number, row["body"])
+                    if response is not None and response.status_code < 300:
+                        cursor.execute(
+                            "UPDATE pending_notifications SET delivered_at = NOW() WHERE id = %s;",
+                            (row["id"],),
+                        )
+    except Exception as error:
+        print("[V10] DELIVER_PENDING_NOTIFICATION_ERROR", repr(error))
+
+
+def retrieve_whatsapp_media(media_id):
+    if not media_id:
+        raise ValueError("Media ID ausente.")
+    if not WHATSAPP_TOKEN or not PHONE_NUMBER_ID:
+        raise RuntimeError("WHATSAPP_TOKEN/PHONE_NUMBER_ID não configurados.")
+
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
+    metadata_url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{media_id}"
+    metadata_response = requests.get(
+        metadata_url,
+        params={"phone_number_id": PHONE_NUMBER_ID},
+        headers=headers,
+        timeout=30,
+    )
+    if metadata_response.status_code != 200:
+        raise RuntimeError(
+            f"Não foi possível obter a URL do áudio: "
+            f"{metadata_response.status_code} {metadata_response.text}"
+        )
+    metadata = metadata_response.json()
+    media_url = metadata.get("url")
+    if not media_url:
+        raise RuntimeError("WhatsApp não retornou URL da mídia.")
+
+    download_response = requests.get(media_url, headers=headers, timeout=60)
+    if download_response.status_code != 200:
+        raise RuntimeError(
+            f"Não foi possível baixar o áudio: "
+            f"{download_response.status_code} {download_response.text}"
+        )
+
+    return {
+        "content": download_response.content,
+        "mime_type": metadata.get("mime_type") or download_response.headers.get("Content-Type") or "audio/ogg",
+        "file_size": metadata.get("file_size") or len(download_response.content),
+    }
+
+
+def audio_filename_for_mime(mime_type):
+    mime_type = (mime_type or "").split(";")[0].strip().lower()
+    mapping = {
+        "audio/ogg": ".ogg",
+        "audio/opus": ".ogg",
+        "audio/mpeg": ".mp3",
+        "audio/mp3": ".mp3",
+        "audio/mp4": ".mp4",
+        "audio/aac": ".aac",
+        "audio/amr": ".amr",
+        "audio/wav": ".wav",
+        "audio/x-wav": ".wav",
+        "audio/webm": ".webm",
+    }
+    return "whatsapp_audio" + mapping.get(mime_type, mimetypes.guess_extension(mime_type) or ".ogg")
+
+
+def transcribe_whatsapp_audio(media_id):
+    media = retrieve_whatsapp_media(media_id)
+    file_obj = io.BytesIO(media["content"])
+    file_obj.name = audio_filename_for_mime(media.get("mime_type"))
+    print(
+        "[V10] AUDIO_TRANSCRIBE_START",
+        {"mime_type": media.get("mime_type"), "file_size": media.get("file_size")},
+    )
+    transcript = openai_client.audio.transcriptions.create(
+        model=OPENAI_TRANSCRIBE_MODEL,
+        file=file_obj,
+        language="pt",
+    )
+    text = getattr(transcript, "text", None)
+    if not text and isinstance(transcript, dict):
+        text = transcript.get("text")
+    text = (text or "").strip()
+    if not text:
+        raise RuntimeError("A transcrição do áudio veio vazia.")
+    print("[V10] AUDIO_TRANSCRIBE_DONE", {"chars": len(text)})
+    return text
+
+
+def process_audio_message(sender, user_id, media_id):
+    try:
+        transcript = transcribe_whatsapp_audio(media_id)
+        send_whatsapp_message(
+            sender,
+            "🎙️ ÁUDIO ENTENDIDO\n\n" + transcript,
+        )
+        process_dynamic_analysis(sender, user_id, transcript)
+    except Exception as error:
+        print("[V10] AUDIO_PROCESS_ERROR", repr(error))
+        traceback.print_exc()
+        send_whatsapp_message(
+            sender,
+            "❌ Não consegui entender esse áudio. Tente enviar novamente ou escreva a mensagem em texto.",
+        )
+        release_analysis_lock(user_id)
 
 # =========================================================
 # META ADS — LEADS / RELATÓRIO / CRIAÇÃO
@@ -1474,6 +2030,9 @@ ALLOWED_SORT_METRICS = {
     "cpl",
     "landing_page_views",
     "cost_per_landing_page_view",
+    "lpv_rate_from_link_clicks",
+    "lead_rate_from_lpv",
+    "lead_rate_from_link_clicks",
 }
 
 
@@ -1561,6 +2120,14 @@ def get_landing_page_views(actions):
     )
 
 
+def safe_rate(numerator, denominator, multiplier=100):
+    numerator = safe_float(numerator)
+    denominator = safe_float(denominator)
+    if denominator <= 0:
+        return 0
+    return metric_round((numerator / denominator) * multiplier, 4)
+
+
 def build_metrics(spend, impressions, reach, clicks, link_clicks, leads, lpv):
     spend = safe_float(spend)
     impressions = safe_int(impressions)
@@ -1577,11 +2144,8 @@ def build_metrics(spend, impressions, reach, clicks, link_clicks, leads, lpv):
         "frequency": metric_round(impressions / reach if reach else 0, 4),
         "clicks": clicks,
         "link_clicks": link_clicks,
-        "ctr": metric_round((clicks / impressions * 100) if impressions else 0, 4),
-        "link_ctr": metric_round(
-            (link_clicks / impressions * 100) if impressions else 0,
-            4,
-        ),
+        "ctr": safe_rate(clicks, impressions),
+        "link_ctr": safe_rate(link_clicks, impressions),
         "cpc": metric_round(spend / clicks, 4) if clicks else (None if spend > 0 else 0),
         "link_cpc": (
             metric_round(spend / link_clicks, 4)
@@ -1601,8 +2165,227 @@ def build_metrics(spend, impressions, reach, clicks, link_clicks, leads, lpv):
             if lpv
             else (None if spend > 0 else 0)
         ),
+        # Taxas do funil calculadas no backend para permitir diagnóstico por etapa.
+        "lpv_rate_from_link_clicks": safe_rate(lpv, link_clicks),
+        "lead_rate_from_lpv": safe_rate(leads, lpv),
+        "lead_rate_from_link_clicks": safe_rate(leads, link_clicks),
     }
 
+
+def share_percent(value, total):
+    total = safe_float(total)
+    if total <= 0:
+        return 0
+    return metric_round(safe_float(value) / total * 100, 2)
+
+
+def build_entity_analysis(rows, summary, level):
+    """
+    Converte uma lista extensa de métricas em sinais de decisão.
+    Não inventa causa: apenas mede concentração, eficiência e materialidade.
+    """
+    if level == "account":
+        return {
+            "funnel": {
+                "cpm": summary.get("cpm"),
+                "link_ctr": summary.get("link_ctr"),
+                "link_cpc": summary.get("link_cpc"),
+                "lpv_rate_from_link_clicks": summary.get("lpv_rate_from_link_clicks"),
+                "lead_rate_from_lpv": summary.get("lead_rate_from_lpv"),
+                "lead_rate_from_link_clicks": summary.get("lead_rate_from_link_clicks"),
+                "cpl": summary.get("cpl"),
+            }
+        }
+
+    total_spend = safe_float(summary.get("spend"))
+    total_leads = safe_float(summary.get("leads"))
+    benchmark_cpl = summary.get("cpl")
+    enriched = []
+
+    for row in rows:
+        spend = safe_float(row.get("spend"))
+        leads = safe_float(row.get("leads"))
+        cpl = row.get("cpl")
+        spend_share = share_percent(spend, total_spend)
+        lead_share = share_percent(leads, total_leads)
+        share_gap = metric_round(spend_share - lead_share, 2)
+
+        cpl_vs_account_pct = None
+        if cpl is not None and benchmark_cpl not in (None, 0):
+            cpl_vs_account_pct = metric_round(
+                (safe_float(cpl) / safe_float(benchmark_cpl) - 1) * 100,
+                2,
+            )
+
+        flags = []
+        if spend > 0 and leads <= 0:
+            flags.append("spend_without_leads")
+        if cpl_vs_account_pct is not None and cpl_vs_account_pct >= 25 and spend_share >= 5:
+            flags.append("material_cpl_above_account")
+        if cpl_vs_account_pct is not None and cpl_vs_account_pct <= -20 and lead_share >= 5:
+            flags.append("material_efficiency_above_account")
+        if share_gap >= 8:
+            flags.append("spend_share_above_lead_share")
+        if share_gap <= -8:
+            flags.append("lead_share_above_spend_share")
+
+        attention_score = (
+            max(share_gap, 0)
+            + (max(cpl_vs_account_pct or 0, 0) / 100.0) * spend_share
+            + (spend_share if leads <= 0 and spend > 0 else 0)
+        )
+        strength_score = (
+            max(-share_gap, 0)
+            + (max(-(cpl_vs_account_pct or 0), 0) / 100.0) * lead_share
+        )
+
+        enriched.append({
+            "id": entity_id_for_row(row, level),
+            "name": entity_name_for_row(row, level),
+            "spend": row.get("spend"),
+            "leads": row.get("leads"),
+            "cpl": row.get("cpl"),
+            "link_ctr": row.get("link_ctr"),
+            "link_cpc": row.get("link_cpc"),
+            "spend_share_pct": spend_share,
+            "lead_share_pct": lead_share,
+            "spend_minus_lead_share_pp": share_gap,
+            "cpl_vs_account_pct": cpl_vs_account_pct,
+            "flags": flags,
+            "attention_score": metric_round(attention_score, 4),
+            "strength_score": metric_round(strength_score, 4),
+        })
+
+    by_spend = sorted(enriched, key=lambda x: safe_float(x.get("spend")), reverse=True)
+    attention = sorted(enriched, key=lambda x: safe_float(x.get("attention_score")), reverse=True)
+    strengths = sorted(enriched, key=lambda x: safe_float(x.get("strength_score")), reverse=True)
+
+    return {
+        "benchmark": {
+            "account_cpl": benchmark_cpl,
+            "total_spend": summary.get("spend"),
+            "total_leads": summary.get("leads"),
+        },
+        "concentration": {
+            "top_3_spend_share_pct": metric_round(
+                sum(safe_float(item.get("spend_share_pct")) for item in by_spend[:3]),
+                2,
+            ),
+        },
+        "top_attention": attention[:5],
+        "top_strengths": [item for item in strengths[:5] if safe_float(item.get("strength_score")) > 0],
+        "spend_without_leads": [
+            item for item in by_spend
+            if "spend_without_leads" in item.get("flags", [])
+        ][:5],
+    }
+
+
+def funnel_change_signals(summary_a, summary_b):
+    checks = [
+        ("cpm", "auction_cost"),
+        ("link_ctr", "traffic_response"),
+        ("link_cpc", "click_cost"),
+        ("lpv_rate_from_link_clicks", "landing_arrival"),
+        ("lead_rate_from_lpv", "post_landing_conversion"),
+        ("lead_rate_from_link_clicks", "click_to_lead_conversion"),
+        ("cpl", "lead_cost"),
+    ]
+    signals = []
+    for metric, stage in checks:
+        old = summary_a.get(metric)
+        new = summary_b.get(metric)
+        if old in (None, 0) or new is None:
+            continue
+        delta = percent_change(old, new)
+        if delta is None:
+            continue
+        signals.append({
+            "stage": stage,
+            "metric": metric,
+            "period_a": old,
+            "period_b": new,
+            "change_pct": delta,
+        })
+    return signals
+
+
+def build_comparison_analysis(period_a_summary, period_b_summary, entities):
+    total_spend_b = safe_float(period_b_summary.get("spend"))
+    total_leads_b = safe_float(period_b_summary.get("leads"))
+    benchmark_cpl_b = period_b_summary.get("cpl")
+    drivers = []
+
+    for item in entities:
+        a = item.get("period_a", {})
+        b = item.get("period_b", {})
+        spend_b = safe_float(b.get("spend"))
+        leads_b = safe_float(b.get("leads"))
+        spend_share_b = share_percent(spend_b, total_spend_b)
+        lead_share_b = share_percent(leads_b, total_leads_b)
+        share_gap_b = metric_round(spend_share_b - lead_share_b, 2)
+        cpl_change = item.get("deltas", {}).get("cpl", {}).get("percent")
+        spend_change = item.get("deltas", {}).get("spend", {}).get("absolute")
+        leads_change = item.get("deltas", {}).get("leads", {}).get("absolute")
+        cpl_b = b.get("cpl")
+
+        cpl_vs_account_b = None
+        if cpl_b is not None and benchmark_cpl_b not in (None, 0):
+            cpl_vs_account_b = metric_round(
+                (safe_float(cpl_b) / safe_float(benchmark_cpl_b) - 1) * 100,
+                2,
+            )
+
+        negative_score = (
+            max(share_gap_b, 0)
+            + (max(safe_float(cpl_change), 0) / 100.0) * spend_share_b
+            + (spend_share_b if spend_b > 0 and leads_b <= 0 else 0)
+        )
+        positive_score = (
+            max(-share_gap_b, 0)
+            + (max(-safe_float(cpl_change), 0) / 100.0) * lead_share_b
+        )
+
+        drivers.append({
+            "id": item.get("id"),
+            "name": item.get("name"),
+            "current_spend": b.get("spend"),
+            "current_leads": b.get("leads"),
+            "current_cpl": b.get("cpl"),
+            "spend_change_absolute": spend_change,
+            "leads_change_absolute": leads_change,
+            "cpl_change_pct": cpl_change,
+            "current_spend_share_pct": spend_share_b,
+            "current_lead_share_pct": lead_share_b,
+            "spend_minus_lead_share_pp": share_gap_b,
+            "current_cpl_vs_account_pct": cpl_vs_account_b,
+            "negative_impact_score": metric_round(negative_score, 4),
+            "positive_impact_score": metric_round(positive_score, 4),
+        })
+
+    negative = sorted(drivers, key=lambda x: safe_float(x.get("negative_impact_score")), reverse=True)
+    positive = sorted(drivers, key=lambda x: safe_float(x.get("positive_impact_score")), reverse=True)
+
+    return {
+        "account_direction": {
+            "spend_change_pct": percent_change(period_a_summary.get("spend"), period_b_summary.get("spend")),
+            "leads_change_pct": percent_change(period_a_summary.get("leads"), period_b_summary.get("leads")),
+            "cpl_change_pct": percent_change(period_a_summary.get("cpl"), period_b_summary.get("cpl")),
+        },
+        "funnel_change_signals": funnel_change_signals(period_a_summary, period_b_summary),
+        "main_negative_drivers": [
+            item for item in negative[:5]
+            if safe_float(item.get("negative_impact_score")) > 0
+        ],
+        "main_positive_drivers": [
+            item for item in positive[:5]
+            if safe_float(item.get("positive_impact_score")) > 0
+        ],
+        "interpretation_note": (
+            "Os scores são heurísticas de priorização por materialidade e eficiência, "
+            "não prova causal. Use os dados brutos para sustentar a conclusão final."
+        ),
+    }
 
 def entity_fields_for_level(level):
     if level == "campaign":
@@ -1721,152 +2504,6 @@ def meta_get_paginated(url, params, max_pages=20):
     return rows
 
 
-def query_meta_insights(
-    context,
-    since,
-    until,
-    level="account",
-    search=None,
-    limit=25,
-    sort_by="spend",
-    sort_order="desc",
-    min_spend=0,
-    include_zero_spend=True,
-):
-    print(
-        "[DYNAMIC] QUERY_INSIGHTS_START",
-        {
-            "since": since,
-            "until": until,
-            "level": level,
-            "search": search,
-            "limit": limit,
-            "sort_by": sort_by,
-            "sort_order": sort_order,
-            "min_spend": min_spend,
-        },
-    )
-
-    if level not in ALLOWED_LEVELS:
-        raise ValueError(f"Nível inválido: {level}")
-
-    if sort_by not in ALLOWED_SORT_METRICS:
-        raise ValueError(f"Métrica de ordenação inválida: {sort_by}")
-
-    sort_order = (sort_order or "desc").lower()
-    if sort_order not in {"asc", "desc"}:
-        raise ValueError("sort_order deve ser asc ou desc.")
-
-    limit = max(1, min(int(limit or 25), 100))
-    min_spend = max(0.0, safe_float(min_spend))
-    today = get_today_for_context(context)
-    validate_date_range(since, until, today=today)
-
-    ad_account_id, access_token, credential_error = get_meta_credentials(context)
-    if credential_error:
-        raise RuntimeError(credential_error)
-
-    fields = [
-        "account_id",
-        "account_name",
-        "date_start",
-        "date_stop",
-        "spend",
-        "impressions",
-        "reach",
-        "clicks",
-        "inline_link_clicks",
-        "actions",
-    ]
-
-    for field in entity_fields_for_level(level):
-        if field not in fields:
-            fields.append(field)
-
-    url = (
-        f"https://graph.facebook.com/{GRAPH_API_VERSION}/"
-        f"{ad_account_id}/insights"
-    )
-    params = {
-        "access_token": access_token,
-        "fields": ",".join(fields),
-        "time_range": json.dumps({"since": since, "until": until}),
-        "level": level,
-        "limit": 500,
-    }
-
-    proof = appsecret_proof(access_token)
-    if proof:
-        params["appsecret_proof"] = proof
-
-    raw_rows = meta_get_paginated(url, params)
-    normalized = [normalize_insight_row(row, level) for row in raw_rows]
-
-    if search:
-        needle = normalize_text(str(search))
-        normalized = [
-            row
-            for row in normalized
-            if needle in normalize_text(
-                " ".join(
-                    str(row.get(field) or "")
-                    for field in entity_fields_for_level(level)
-                )
-            )
-        ]
-
-    normalized = [
-        row for row in normalized
-        if safe_float(row.get("spend")) >= min_spend
-    ]
-
-    if not include_zero_spend:
-        normalized = [
-            row for row in normalized
-            if safe_float(row.get("spend")) > 0
-        ]
-
-    reverse = sort_order == "desc"
-
-    def sort_key(row):
-        value = row.get(sort_by)
-        undefined_with_spend = value is None and safe_float(row.get("spend")) > 0
-        # Em métricas de custo, ausência de conversão/clique com gasto é pior,
-        # não um falso zero. No DESC sobe para o topo; no ASC vai para o fim.
-        if sort_by in {
-            "cpl",
-            "cpc",
-            "link_cpc",
-            "cpm",
-            "cost_per_landing_page_view",
-        }:
-            return (1 if undefined_with_spend else 0, safe_float(value))
-        return (0, safe_float(value))
-
-    normalized.sort(key=sort_key, reverse=reverse)
-
-    full_summary = aggregate_rows(normalized)
-    returned_rows = normalized[:limit]
-
-    result = {
-        "period": {"since": since, "until": until},
-        "level": level,
-        "account_id": ad_account_id,
-        "matched_rows": len(normalized),
-        "returned_rows": len(returned_rows),
-        "summary": full_summary,
-        "rows": returned_rows,
-    }
-
-    print(
-        "[DYNAMIC] QUERY_INSIGHTS_DONE",
-        {
-            "matched_rows": result["matched_rows"],
-            "returned_rows": result["returned_rows"],
-            "summary": result["summary"],
-        },
-    )
-    return result
 
 
 def percent_change(old_value, new_value):
@@ -2105,6 +2742,11 @@ def compare_meta_periods(
         },
         "summary_deltas_a_to_b": summary_deltas,
         "entities": entities,
+        "analysis": build_comparison_analysis(
+            report_a["summary"],
+            report_b["summary"],
+            entities,
+        ),
         "note": (
             "Percentual nulo significa que o valor do período A era zero; "
             "não é possível calcular variação percentual convencional."
@@ -2112,259 +2754,23 @@ def compare_meta_periods(
     }
 
 
-def list_meta_structure(context, level="campaign", search=None, limit=50):
-    if level not in {"campaign", "adset", "ad"}:
-        raise ValueError("level deve ser campaign, adset ou ad.")
-
-    ad_account_id, access_token, credential_error = get_meta_credentials(context)
-    if credential_error:
-        raise RuntimeError(credential_error)
-
-    endpoint = {
-        "campaign": "campaigns",
-        "adset": "adsets",
-        "ad": "ads",
-    }[level]
-
-    fields = ["id", "name", "status", "effective_status"]
-    if level == "adset":
-        fields.append("campaign_id")
-    if level == "ad":
-        fields.extend(["campaign_id", "adset_id"])
-
-    url = (
-        f"https://graph.facebook.com/{GRAPH_API_VERSION}/"
-        f"{ad_account_id}/{endpoint}"
-    )
-    params = {
-        "access_token": access_token,
-        "fields": ",".join(fields),
-        "limit": 200,
-    }
-    proof = appsecret_proof(access_token)
-    if proof:
-        params["appsecret_proof"] = proof
-
-    rows = meta_get_paginated(url, params, max_pages=10)
-
-    if search:
-        needle = normalize_text(str(search))
-        rows = [
-            row
-            for row in rows
-            if needle in normalize_text(
-                f"{row.get('id', '')} {row.get('name', '')}"
-            )
-        ]
-
-    limit = max(1, min(int(limit or 50), 100))
-    return {
-        "level": level,
-        "matched_rows": len(rows),
-        "rows": rows[:limit],
-    }
 
 
 # =========================================================
 # OPENAI — MOTOR DINÂMICO / TOOL CALLING
 # =========================================================
 
-DYNAMIC_ANALYSIS_TOOLS = [
-    {
-        "type": "function",
-        "name": "consultar_insights",
-        "description": (
-            "Consulta métricas reais de Meta Ads em um período exato, no nível "
-            "de conta, campanha, conjunto ou anúncio. Use para responder perguntas "
-            "quantitativas, rankings e aprofundamentos."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "since": {
-                    "type": "string",
-                    "description": "Data inicial inclusiva no formato YYYY-MM-DD.",
-                },
-                "until": {
-                    "type": "string",
-                    "description": "Data final inclusiva no formato YYYY-MM-DD.",
-                },
-                "level": {
-                    "type": "string",
-                    "enum": ["account", "campaign", "adset", "ad"],
-                },
-                "search": {
-                    "type": ["string", "null"],
-                    "description": "Nome ou ID para filtrar uma entidade específica.",
-                },
-                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                "sort_by": {
-                    "type": "string",
-                    "enum": sorted(ALLOWED_SORT_METRICS),
-                },
-                "sort_order": {
-                    "type": "string",
-                    "enum": ["asc", "desc"],
-                },
-                "min_spend": {"type": "number", "minimum": 0},
-                "include_zero_spend": {"type": "boolean"},
-            },
-            "required": ["since", "until", "level"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "type": "function",
-        "name": "comparar_periodos",
-        "description": (
-            "Compara dois períodos de Meta Ads e calcula as variações no backend. "
-            "Para 'este mês x mês passado', use current_month_vs_previous_equivalent. "
-            "Para 'últimos N dias x N anteriores', use last_n_days_vs_previous_n_days. "
-            "Para datas ou meses explicitamente pedidos, use custom."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "mode": {
-                    "type": "string",
-                    "enum": [
-                        "current_month_vs_previous_equivalent",
-                        "last_n_days_vs_previous_n_days",
-                        "custom",
-                    ],
-                },
-                "level": {
-                    "type": "string",
-                    "enum": ["account", "campaign", "adset", "ad"],
-                },
-                "n_days": {"type": ["integer", "null"], "minimum": 1, "maximum": 365},
-                "period_a_since": {"type": ["string", "null"]},
-                "period_a_until": {"type": ["string", "null"]},
-                "period_b_since": {"type": ["string", "null"]},
-                "period_b_until": {"type": ["string", "null"]},
-                "period_a_label": {"type": ["string", "null"]},
-                "period_b_label": {"type": ["string", "null"]},
-                "search": {"type": ["string", "null"]},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
-                "sort_by": {
-                    "type": "string",
-                    "enum": sorted(ALLOWED_SORT_METRICS),
-                },
-            },
-            "required": ["mode", "level"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "type": "function",
-        "name": "listar_estrutura_meta",
-        "description": (
-            "Lista campanhas, conjuntos ou anúncios da conta para localizar nomes/IDs "
-            "e resolver referências do usuário. Não retorna performance."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "level": {
-                    "type": "string",
-                    "enum": ["campaign", "adset", "ad"],
-                },
-                "search": {"type": ["string", "null"]},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-            },
-            "required": ["level"],
-            "additionalProperties": False,
-        },
-    },
-]
 
 
-def build_dynamic_instructions(context):
-    today = get_today_for_context(context)
-    return f"""
-Você é o analista sênior de Meta Ads de um produto SaaS conversacional.
-Empresa atual: {context.get('company_name')}.
-Conta Meta selecionada: {context.get('ad_account_id') or 'nenhuma'}.
-Data atual na timezone da conta: {today.isoformat()}.
-
-REGRAS ABSOLUTAS:
-- Responda em português do Brasil, de forma prática, direta e analítica.
-- Para qualquer afirmação quantitativa sobre a conta, use as ferramentas.
-- Se o usuário não informar período e o contexto anterior não estabelecer um, use o mês atual até hoje.
-- Nunca invente números, campanhas, conjuntos, anúncios ou causas.
-- A ferramenta traz fatos; causas que não estejam provadas devem ser chamadas de hipótese.
-- CPL, CTR, CPC, CPM e demais métricas derivadas são calculadas pelo backend.
-- Quando o usuário disser 'este mês x mês passado' e o mês atual estiver incompleto,
-  use comparar_periodos com mode=current_month_vs_previous_equivalent.
-- Se o usuário pedir meses completos ou datas específicas, use mode=custom e respeite as datas.
-- Para 'últimos N dias', quando houver comparação, use períodos de mesmo tamanho.
-- Se precisar aprofundar uma campanha/conjunto/anúncio citado anteriormente, mantenha o contexto
-  e consulte o nível inferior apropriado, filtrando pelo nome ou ID conhecido.
-- Não execute criação ou alteração de campanhas por estas ferramentas; elas são somente leitura.
-- Se a pergunta não for sobre Meta Ads, explique brevemente o escopo e ofereça exemplos do que pode analisar.
-- Se não houver dados, diga explicitamente que a Meta não retornou dados para aquele recorte.
-
-FORMATO:
-Adapte o formato à pergunta. Em análises, prefira:
-📊 Resumo
-✅ O que melhorou
-⚠️ O que piorou / atenção
-🔎 Onde está o impacto
-🎯 Próxima ação
-Não force todas as seções quando uma resposta curta for suficiente.
-"""
 
 
-def execute_dynamic_tool(context, tool_name, arguments):
-    print(f"[DYNAMIC] TOOL_EXECUTE name={tool_name} args={arguments}")
-
-    if tool_name == "consultar_insights":
-        return query_meta_insights(
-            context,
-            since=arguments["since"],
-            until=arguments["until"],
-            level=arguments.get("level", "account"),
-            search=arguments.get("search"),
-            limit=arguments.get("limit", 25),
-            sort_by=arguments.get("sort_by", "spend"),
-            sort_order=arguments.get("sort_order", "desc"),
-            min_spend=arguments.get("min_spend", 0),
-            include_zero_spend=arguments.get("include_zero_spend", True),
-        )
-
-    if tool_name == "comparar_periodos":
-        return compare_meta_periods(
-            context,
-            mode=arguments["mode"],
-            level=arguments.get("level", "account"),
-            n_days=arguments.get("n_days"),
-            period_a_since=arguments.get("period_a_since"),
-            period_a_until=arguments.get("period_a_until"),
-            period_b_since=arguments.get("period_b_since"),
-            period_b_until=arguments.get("period_b_until"),
-            period_a_label=arguments.get("period_a_label"),
-            period_b_label=arguments.get("period_b_label"),
-            search=arguments.get("search"),
-            limit=arguments.get("limit", 25),
-            sort_by=arguments.get("sort_by", "spend"),
-        )
-
-    if tool_name == "listar_estrutura_meta":
-        return list_meta_structure(
-            context,
-            level=arguments["level"],
-            search=arguments.get("search"),
-            limit=arguments.get("limit", 50),
-        )
-
-    raise ValueError(f"Tool desconhecida: {tool_name}")
 
 
 def create_dynamic_openai_response(context, user_question, previous_response_id=None):
     kwargs = {
-        "model": OPENAI_MODEL,
-        "reasoning": {"effort": "low"},
-        "max_output_tokens": 1400,
+        "model": OPENAI_ANALYSIS_MODEL,
+        "reasoning": {"effort": OPENAI_ANALYSIS_REASONING_EFFORT},
+        "max_output_tokens": 1200,
         "instructions": build_dynamic_instructions(context),
         "tools": DYNAMIC_ANALYSIS_TOOLS,
         "tool_choice": "auto",
@@ -2385,7 +2791,8 @@ def run_dynamic_openai_analysis(context, user_question):
     print(
         "[DYNAMIC] OPENAI_FIRST_CALL",
         {
-            "model": OPENAI_MODEL,
+            "model": OPENAI_ANALYSIS_MODEL,
+            "reasoning_effort": OPENAI_ANALYSIS_REASONING_EFFORT,
             "has_previous_response": bool(previous_response_id),
         },
     )
@@ -2419,7 +2826,7 @@ def run_dynamic_openai_analysis(context, user_question):
         },
     )
 
-    max_tool_rounds = 6
+    max_tool_rounds = 8
     for round_number in range(1, max_tool_rounds + 1):
         tool_calls = [
             item for item in response.output
@@ -2431,6 +2838,7 @@ def run_dynamic_openai_analysis(context, user_question):
             if not final_text:
                 raise RuntimeError("OpenAI não retornou texto final.")
             save_ai_conversation_state(context, response.id)
+            final_text = clean_ai_text_for_whatsapp(final_text)
             return final_text, response.id
 
         print(
@@ -2483,9 +2891,9 @@ def run_dynamic_openai_analysis(context, user_question):
         )
 
         response = openai_client.responses.create(
-            model=OPENAI_MODEL,
-            reasoning={"effort": "low"},
-            max_output_tokens=1400,
+            model=OPENAI_ANALYSIS_MODEL,
+            reasoning={"effort": OPENAI_ANALYSIS_REASONING_EFFORT},
+            max_output_tokens=1200,
             instructions=build_dynamic_instructions(context),
             tools=DYNAMIC_ANALYSIS_TOOLS,
             tool_choice="auto",
@@ -2545,6 +2953,9 @@ def process_dynamic_analysis(sender, user_id, original_text):
             )
             return
 
+        context = dict(context)
+        context["_current_user_text"] = original_text
+
         if not context.get("can_read_ads"):
             send_whatsapp_message(
                 sender,
@@ -2580,7 +2991,16 @@ def process_dynamic_analysis(sender, user_id, original_text):
             },
         )
 
-        send_whatsapp_long_message(sender, answer)
+        formatted_answer = clean_ai_text_for_whatsapp(answer)
+        print(
+            "[DYNAMIC] FORMAT_CHECK",
+            {
+                "contains_hash": "#" in formatted_answer,
+                "contains_asterisk": "*" in formatted_answer,
+                "chars": len(formatted_answer),
+            },
+        )
+        send_whatsapp_long_message(sender, formatted_answer)
         print("[DYNAMIC] JOB_DONE")
 
     except Exception as error:
@@ -2650,7 +3070,14 @@ Nunca invente números, campanhas, anúncios, conjuntos ou causas.
 Diferencie fatos de hipóteses.
 Responda em português do Brasil.
 
-Estruture em:
+FORMATO PARA WHATSAPP:
+- Use TEXTO PURO, sem Markdown.
+- Não use #, *, _, `, >, |, tabelas ou cercas de código.
+- Destaque blocos apenas com emoji + título curto em MAIÚSCULAS.
+- Use • somente quando realmente houver uma lista.
+- Mantenha a resposta limpa, compacta e fácil de escanear.
+
+Quando fizer sentido, organize em:
 📊 RESUMO
 ✅ PONTOS POSITIVOS
 ⚠️ PONTOS DE ATENÇÃO
@@ -2665,12 +3092,12 @@ DADOS:
 """,
     )
 
-    return response.output_text
+    return clean_ai_text_for_whatsapp(response.output_text)
 
 
 def build_basic_report(report):
     text = (
-        "📊 *META ADS — ÚLTIMOS 7 DIAS*\n\n"
+        "📊 META ADS — ÚLTIMOS 7 DIAS\n\n"
         f"💰 Investimento: {format_brl(report['spend'])}\n"
         f"👁 Impressões: {format_number(report['impressions'])}\n"
         f"🖱 Cliques: {format_number(report['clicks'])}\n"
@@ -2702,15 +3129,10 @@ def receive_webhook():
             return "EVENT_RECEIVED", 200
 
         message = messages[0]
-        if message.get("type") != "text":
+        message_type = message.get("type")
+        sender = message.get("from")
+        if not sender:
             return "EVENT_RECEIVED", 200
-
-        sender = message["from"]
-        original_text = message["text"]["body"].strip()
-        received_text = normalize_text(original_text)
-
-        print("MENSAGEM:", original_text)
-        print("REMETENTE:", sender)
 
         context = get_user_context(sender)
         print(
@@ -2720,6 +3142,7 @@ def receive_webhook():
                 "user_id": context.get("user_id") if context else None,
                 "company_id": context.get("company_id") if context else None,
                 "ad_account_id": context.get("ad_account_id") if context else None,
+                "message_type": message_type,
             },
         )
 
@@ -2729,6 +3152,47 @@ def receive_webhook():
                 "⛔ Este número ainda não está cadastrado no sistema.",
             )
             return "EVENT_RECEIVED", 200
+
+        if not register_inbound_message(context, message.get("id"), message_type, sender):
+            print("[V10] DUPLICATE_WEBHOOK_IGNORED", message.get("id"))
+            return "EVENT_RECEIVED", 200
+
+        touch_last_inbound(context)
+        deliver_pending_notifications(context, sender)
+
+        if message_type == "audio":
+            media_id = (message.get("audio") or {}).get("id")
+            if not media_id:
+                send_whatsapp_message(sender, "❌ Recebi o áudio, mas não encontrei o arquivo para transcrever.")
+                return "EVENT_RECEIVED", 200
+
+            if not acquire_analysis_lock(context["user_id"]):
+                send_whatsapp_message(sender, "⏳ Já estou processando outra solicitação sua. Tente novamente em instantes.")
+                return "EVENT_RECEIVED", 200
+
+            send_whatsapp_message(sender, "🎙️ Áudio recebido. Vou ouvir e executar a mesma lógica de uma mensagem de texto.")
+            try:
+                audio_thread = threading.Thread(
+                    target=process_audio_message,
+                    args=(sender, context["user_id"], media_id),
+                    daemon=True,
+                    name=f"audio-analysis-{context['user_id']}",
+                )
+                audio_thread.start()
+            except Exception:
+                release_analysis_lock(context["user_id"])
+                raise
+            return "EVENT_RECEIVED", 200
+
+        if message_type != "text":
+            send_whatsapp_message(sender, "ℹ️ Neste momento eu entendo mensagens de texto e áudio.")
+            return "EVENT_RECEIVED", 200
+
+        original_text = (message.get("text") or {}).get("body", "").strip()
+        received_text = normalize_text(original_text)
+
+        print("MENSAGEM:", original_text)
+        print("REMETENTE:", sender)
 
         # =================================================
         # CONECTAR META — OAUTH POR CLIENTE
@@ -3031,7 +3495,7 @@ def receive_webhook():
         # RELATÓRIO / IA
         # =================================================
 
-        if "gasto" in received_text and "7" in received_text:
+        if received_text == "gasto legado 7 dias":
             if not context["can_read_ads"]:
                 send_whatsapp_message(sender, "⛔ Você não possui permissão de leitura.")
                 return "EVENT_RECEIVED", 200
@@ -3060,7 +3524,7 @@ def receive_webhook():
             send_whatsapp_message(sender, build_basic_report(report))
             return "EVENT_RECEIVED", 200
 
-        if "analise" in received_text and "7" in received_text:
+        if received_text == "analise legado 7 dias":
             if not context["can_read_ads"]:
                 send_whatsapp_message(sender, "⛔ Você não possui permissão de leitura.")
                 return "EVENT_RECEIVED", 200
@@ -3105,16 +3569,15 @@ def receive_webhook():
                 f"Empresa: *{context['company_name']}*\n\n"
                 "Você pode perguntar em linguagem natural, por exemplo:\n\n"
                 "• Compare este mês com o mês passado\n"
-                "• Quais campanhas mais prejudicaram meu CPL?\n"
-                "• Quais anúncios gastaram mais de R$ 500 sem gerar leads?\n"
+                "• Analise minha conta respeitando o setup real de cada campanha\n"
+                "• Identifique na Meta o objetivo desta campanha e analise o resultado correto\n"
+                "• Quais campanhas realmente merecem atenção considerando o próprio setup?\n"
                 "• Compare os últimos 15 dias com os 15 anteriores\n"
                 "• Agora aprofunde na campanha que você acabou de citar\n\n"
                 "Comandos administrativos/técnicos:\n\n"
                 "🔗 conectar meta\n"
                 "📂 minhas contas meta\n"
                 "👤 quem sou eu\n"
-                "📊 gasto últimos 7 dias\n"
-                "🤖 analise meus últimos 7 dias\n"
                 "🔧 criar campanha teste"
             )
 
@@ -3171,6 +3634,2232 @@ def receive_webhook():
         traceback.print_exc()
 
     return "EVENT_RECEIVED", 200
+
+
+
+# =========================================================
+# V9.1 — MOTOR META-DRIVEN / SEM TABELA FIXA DE OBJETIVOS
+# =========================================================
+#
+# Princípio central:
+# - a Meta é a fonte da verdade sobre o setup;
+# - o backend busca objective, optimization_goal e demais campos reais;
+# - o backend NÃO mantém uma tabela dizendo "objective X => KPI Y";
+# - a OpenAI interpreta o setup retornado pela própria Meta;
+# - quando a IA escolhe um action_type como resultado relevante, o backend
+#   valida se esse action_type realmente existe nos Insights antes de usá-lo.
+#
+# Isso evita tratar "Resultados" como sinônimo de lead e evita engessar o
+# produto quando a Meta cria/renomeia objetivos, performance goals ou eventos.
+
+V91_BASE_SORT_METRICS = {
+    "spend",
+    "impressions",
+    "reach",
+    "frequency",
+    "clicks",
+    "link_clicks",
+    "ctr",
+    "link_ctr",
+    "cpc",
+    "link_cpc",
+    "cpm",
+    "landing_page_views",
+    "cost_per_landing_page_view",
+    "selected_action_value",
+    "selected_action_cost",
+}
+
+
+def v91_json_safe(value):
+    """Converte objetos aninhados em estruturas JSON simples sem inventar semântica."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): v91_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [v91_json_safe(v) for v in value]
+    return str(value)
+
+
+def v91_action_catalog(items):
+    """
+    Converte AdsActionStats em mapa action_type -> value.
+    Não seleciona qual action_type é "resultado"; apenas preserva o que a Meta retornou.
+    """
+    catalog = {}
+    raw = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        clean = v91_json_safe(item)
+        raw.append(clean)
+        action_type = item.get("action_type")
+        if not action_type:
+            continue
+        value = item.get("value")
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = value
+        catalog[str(action_type)] = numeric
+    return catalog, raw[:120]
+
+
+def v91_sum_action_catalogs(rows, field_name):
+    total = {}
+    for row in rows:
+        catalog = row.get(field_name) or {}
+        for key, value in catalog.items():
+            if isinstance(value, (int, float)):
+                total[key] = total.get(key, 0.0) + float(value)
+    return {key: metric_round(value, 4) for key, value in total.items()}
+
+
+def v91_meta_get_edge_with_fallback(url, access_token, field_variants, limit=500, max_pages=20):
+    """Tenta conjuntos de campos do mais rico ao mais conservador."""
+    proof = appsecret_proof(access_token)
+    last_error = None
+
+    for fields in field_variants:
+        params = {
+            "access_token": access_token,
+            "fields": ",".join(fields),
+            "limit": limit,
+        }
+        if proof:
+            params["appsecret_proof"] = proof
+        try:
+            rows = meta_get_paginated(url, params, max_pages=max_pages)
+            print("[V9.1] META_SETUP_FIELDS_OK", fields)
+            return rows, fields
+        except RuntimeError as error:
+            last_error = error
+            print("[V9.1] META_SETUP_FIELDS_FALLBACK", fields, repr(error))
+
+    if last_error:
+        raise last_error
+    return [], []
+
+
+def v91_fetch_setup_metadata(ad_account_id, access_token):
+    """Busca da própria Meta o setup real de campanhas e conjuntos."""
+    campaigns_url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{ad_account_id}/campaigns"
+    adsets_url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{ad_account_id}/adsets"
+
+    campaign_variants = [
+        [
+            "id", "name", "objective", "status", "effective_status", "buying_type",
+            "bid_strategy", "promoted_object", "smart_promotion_type",
+            "special_ad_categories",
+        ],
+        ["id", "name", "objective", "status", "effective_status", "buying_type", "bid_strategy"],
+        ["id", "name", "objective", "status", "effective_status", "buying_type"],
+    ]
+    adset_variants = [
+        [
+            "id", "name", "campaign_id", "optimization_goal", "optimization_sub_event",
+            "billing_event", "bid_strategy", "promoted_object", "destination_type",
+            "attribution_spec", "status", "effective_status",
+        ],
+        [
+            "id", "name", "campaign_id", "optimization_goal", "billing_event",
+            "bid_strategy", "promoted_object", "status", "effective_status",
+        ],
+        [
+            "id", "name", "campaign_id", "optimization_goal", "billing_event",
+            "status", "effective_status",
+        ],
+    ]
+
+    campaigns, campaign_fields_used = v91_meta_get_edge_with_fallback(
+        campaigns_url, access_token, campaign_variants
+    )
+    adsets, adset_fields_used = v91_meta_get_edge_with_fallback(
+        adsets_url, access_token, adset_variants
+    )
+
+    campaigns_by_id = {
+        str(row.get("id")): v91_json_safe(row)
+        for row in campaigns
+        if row.get("id")
+    }
+    adsets_by_id = {
+        str(row.get("id")): v91_json_safe(row)
+        for row in adsets
+        if row.get("id")
+    }
+    adsets_by_campaign = {}
+    for adset in adsets:
+        campaign_id = str(adset.get("campaign_id") or "")
+        if campaign_id:
+            adsets_by_campaign.setdefault(campaign_id, []).append(v91_json_safe(adset))
+
+    return {
+        "campaigns": campaigns_by_id,
+        "adsets": adsets_by_id,
+        "adsets_by_campaign": adsets_by_campaign,
+        "fields_used": {
+            "campaign": campaign_fields_used,
+            "adset": adset_fields_used,
+        },
+    }
+
+
+def v91_compact_promoted_object(value):
+    """Mantém o promoted_object vindo da Meta, removendo apenas valores vazios."""
+    if not isinstance(value, dict):
+        return v91_json_safe(value)
+    return {
+        str(k): v91_json_safe(v)
+        for k, v in value.items()
+        if v not in (None, "", [], {})
+    }
+
+
+def v91_adset_setup_view(adset):
+    if not adset:
+        return None
+    return {
+        "id": adset.get("id"),
+        "name": adset.get("name"),
+        "optimization_goal": adset.get("optimization_goal"),
+        "optimization_sub_event": adset.get("optimization_sub_event"),
+        "billing_event": adset.get("billing_event"),
+        "destination_type": adset.get("destination_type"),
+        "bid_strategy": adset.get("bid_strategy"),
+        "promoted_object": v91_compact_promoted_object(adset.get("promoted_object")),
+        "attribution_spec": v91_json_safe(adset.get("attribution_spec")),
+        "status": adset.get("status"),
+        "effective_status": adset.get("effective_status"),
+    }
+
+
+def v91_campaign_setup_view(campaign):
+    if not campaign:
+        return None
+    return {
+        "id": campaign.get("id"),
+        "name": campaign.get("name"),
+        "objective": campaign.get("objective"),
+        "buying_type": campaign.get("buying_type"),
+        "bid_strategy": campaign.get("bid_strategy"),
+        "promoted_object": v91_compact_promoted_object(campaign.get("promoted_object")),
+        "smart_promotion_type": campaign.get("smart_promotion_type"),
+        "special_ad_categories": v91_json_safe(campaign.get("special_ad_categories")),
+        "status": campaign.get("status"),
+        "effective_status": campaign.get("effective_status"),
+    }
+
+
+def v91_setup_signature(campaign, adset=None):
+    """
+    Assinatura apenas para saber se dois setups são iguais.
+    Ela NÃO traduz o setup para um KPI.
+    """
+    payload = {
+        "campaign_objective": (campaign or {}).get("objective"),
+        "campaign_promoted_object": v91_compact_promoted_object((campaign or {}).get("promoted_object")),
+        "optimization_goal": (adset or {}).get("optimization_goal"),
+        "optimization_sub_event": (adset or {}).get("optimization_sub_event"),
+        "billing_event": (adset or {}).get("billing_event"),
+        "destination_type": (adset or {}).get("destination_type"),
+        "adset_promoted_object": v91_compact_promoted_object((adset or {}).get("promoted_object")),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def v91_setup_for_insight(raw, level, metadata):
+    campaign_id = str(raw.get("campaign_id") or "")
+    adset_id = str(raw.get("adset_id") or "")
+    campaign = metadata.get("campaigns", {}).get(campaign_id, {})
+    adset = metadata.get("adsets", {}).get(adset_id, {}) if adset_id else {}
+
+    result = {
+        "campaign": v91_campaign_setup_view(campaign),
+        "adset": v91_adset_setup_view(adset) if adset else None,
+        "setup_signature": v91_setup_signature(campaign, adset if adset else None),
+        "source": "meta_marketing_api",
+    }
+
+    if level == "campaign" and campaign_id:
+        adsets = metadata.get("adsets_by_campaign", {}).get(campaign_id, [])
+        variants = []
+        seen = set()
+        for child in adsets:
+            signature = v91_setup_signature(campaign, child)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            variants.append({
+                "setup_signature": signature,
+                "adset_setup": v91_adset_setup_view(child),
+            })
+        result["adset_setup_variants"] = variants[:30]
+        result["setup_variant_count"] = len(variants)
+        result["requires_adset_drilldown"] = len(variants) > 1
+
+    return result
+
+
+def v91_base_metrics(raw):
+    """Métricas universais. Nenhuma delas é declarada automaticamente como KPI principal."""
+    spend = safe_float(raw.get("spend"))
+    impressions = safe_int(raw.get("impressions"))
+    reach = safe_int(raw.get("reach"))
+    clicks = safe_int(raw.get("clicks"))
+    link_clicks = safe_int(raw.get("inline_link_clicks"))
+    lpv = get_landing_page_views(raw.get("actions", []))
+
+    return {
+        "spend": metric_round(spend, 2),
+        "impressions": impressions,
+        "reach": reach,
+        "frequency": metric_round(impressions / reach if reach else 0, 4),
+        "clicks": clicks,
+        "link_clicks": link_clicks,
+        "ctr": safe_rate(clicks, impressions),
+        "link_ctr": safe_rate(link_clicks, impressions),
+        "cpc": metric_round(spend / clicks, 4) if clicks else (None if spend > 0 else 0),
+        "link_cpc": metric_round(spend / link_clicks, 4) if link_clicks else (None if spend > 0 else 0),
+        "cpm": metric_round(spend / impressions * 1000, 4) if impressions else (None if spend > 0 else 0),
+        "landing_page_views": metric_round(lpv, 2),
+        "cost_per_landing_page_view": metric_round(spend / lpv, 4) if lpv else (None if spend > 0 else 0),
+    }
+
+
+def v91_insight_field_variants(level):
+    entity_fields = entity_fields_for_level(level)
+    common = [
+        "account_id", "account_name", "date_start", "date_stop",
+        "spend", "impressions", "reach", "clicks", "inline_link_clicks",
+    ]
+    for field in entity_fields:
+        if field not in common:
+            common.append(field)
+
+    # Estes campos são da própria camada de Insights da Meta. A v9.1 tenta primeiro
+    # obter inclusive os resultados contextualizados pela plataforma; se uma conta/
+    # versão não expuser algum deles, há fallback progressivo.
+    rich = common + [
+        "objective", "optimization_goal",
+        "objective_results", "objective_result_rate",
+        "cost_per_objective_result", "cost_per_result",
+        "actions", "cost_per_action_type", "action_values",
+        "outbound_clicks", "cost_per_outbound_click",
+        "purchase_roas", "website_purchase_roas", "mobile_app_purchase_roas",
+        "video_thruplay_watched_actions", "video_2_sec_continuous_watched_actions",
+    ]
+    standard = common + [
+        "objective", "optimization_goal",
+        "objective_results", "cost_per_objective_result", "cost_per_result",
+        "actions", "cost_per_action_type", "action_values",
+    ]
+    actions_only = common + ["objective", "optimization_goal", "actions", "cost_per_action_type", "action_values"]
+    minimal = common + ["actions"]
+    return [rich, standard, actions_only, minimal]
+
+
+def v91_fetch_raw_insights(ad_account_id, access_token, since, until, level):
+    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{ad_account_id}/insights"
+    proof = appsecret_proof(access_token)
+    last_error = None
+
+    for fields in v91_insight_field_variants(level):
+        params = {
+            "access_token": access_token,
+            "fields": ",".join(fields),
+            "time_range": json.dumps({"since": since, "until": until}),
+            "level": level,
+            "limit": 500,
+        }
+        if proof:
+            params["appsecret_proof"] = proof
+        try:
+            rows = meta_get_paginated(url, params, max_pages=20)
+            print("[V9.1] INSIGHT_FIELDS_OK", fields)
+            return rows, fields
+        except RuntimeError as error:
+            last_error = error
+            print("[V9.1] INSIGHT_FIELDS_FALLBACK", fields, repr(error))
+
+    if last_error:
+        raise last_error
+    return [], []
+
+
+def v91_extract_list_scalar(value):
+    """Preserva listas/objetos da Meta; usado só para deixar o payload serializável."""
+    return v91_json_safe(value)
+
+
+def v91_normalize_insight_row(raw, level, metadata, selected_action_type=None):
+    row = {
+        "date_start": raw.get("date_start"),
+        "date_stop": raw.get("date_stop"),
+    }
+    for field in entity_fields_for_level(level):
+        row[field] = raw.get(field)
+    row.update(v91_base_metrics(raw))
+
+    actions, actions_raw = v91_action_catalog(raw.get("actions"))
+    action_costs, action_costs_raw = v91_action_catalog(raw.get("cost_per_action_type"))
+    action_values, action_values_raw = v91_action_catalog(raw.get("action_values"))
+
+    row["meta_setup"] = v91_setup_for_insight(raw, level, metadata) if level != "account" else {
+        "source": "meta_marketing_api",
+        "note": "Conta não possui um único objective/optimization_goal. Use setup_portfolio por conjunto/campanha.",
+    }
+    row["meta_reported_result"] = {
+        "insights_objective": raw.get("objective"),
+        "insights_optimization_goal": raw.get("optimization_goal"),
+        "objective_results": v91_extract_list_scalar(raw.get("objective_results")),
+        "objective_result_rate": v91_extract_list_scalar(raw.get("objective_result_rate")),
+        "cost_per_objective_result": v91_extract_list_scalar(raw.get("cost_per_objective_result")),
+        "cost_per_result": v91_extract_list_scalar(raw.get("cost_per_result")),
+        "note": (
+            "Campos retornados diretamente pelos Insights da Meta. Se estiverem preenchidos, "
+            "eles têm precedência sobre qualquer inferência manual de 'Resultados'."
+        ),
+    }
+    row["available_actions"] = actions
+    row["available_cost_per_action"] = action_costs
+    row["available_action_values"] = action_values
+    row["raw_action_stats"] = {
+        "actions": actions_raw,
+        "cost_per_action_type": action_costs_raw,
+        "action_values": action_values_raw,
+    }
+
+    # Mantém outros campos ricos sem transformá-los em KPI automaticamente.
+    row["additional_meta_metrics"] = {
+        "outbound_clicks": v91_json_safe(raw.get("outbound_clicks")),
+        "cost_per_outbound_click": v91_json_safe(raw.get("cost_per_outbound_click")),
+        "purchase_roas": v91_json_safe(raw.get("purchase_roas")),
+        "website_purchase_roas": v91_json_safe(raw.get("website_purchase_roas")),
+        "mobile_app_purchase_roas": v91_json_safe(raw.get("mobile_app_purchase_roas")),
+        "video_thruplay_watched_actions": v91_json_safe(raw.get("video_thruplay_watched_actions")),
+        "video_2_sec_continuous_watched_actions": v91_json_safe(raw.get("video_2_sec_continuous_watched_actions")),
+    }
+
+    if selected_action_type:
+        value = actions.get(selected_action_type)
+        meta_cost = action_costs.get(selected_action_type)
+        derived_cost = None
+        if isinstance(value, (int, float)) and float(value) > 0:
+            derived_cost = metric_round(safe_float(row.get("spend")) / float(value), 4)
+        row["selected_action_type"] = selected_action_type
+        row["selected_action_found"] = selected_action_type in actions
+        row["selected_action_value"] = value
+        row["selected_action_cost"] = meta_cost if meta_cost is not None else derived_cost
+        row["selected_action_cost_source"] = (
+            "meta_cost_per_action_type"
+            if meta_cost is not None
+            else ("derived_spend_divided_by_action" if derived_cost is not None else None)
+        )
+
+    return row
+
+
+def v91_aggregate_base(rows):
+    spend = sum(safe_float(row.get("spend")) for row in rows)
+    impressions = sum(safe_int(row.get("impressions")) for row in rows)
+    clicks = sum(safe_int(row.get("clicks")) for row in rows)
+    link_clicks = sum(safe_int(row.get("link_clicks")) for row in rows)
+    lpv = sum(safe_float(row.get("landing_page_views")) for row in rows)
+
+    # Reach somado entre entidades pode duplicar pessoas. Por isso fica explicitamente rotulado.
+    reach_sum = sum(safe_int(row.get("reach")) for row in rows)
+    return {
+        "spend": metric_round(spend, 2),
+        "impressions": impressions,
+        "reach_sum_not_deduplicated": reach_sum,
+        "clicks": clicks,
+        "link_clicks": link_clicks,
+        "ctr": safe_rate(clicks, impressions),
+        "link_ctr": safe_rate(link_clicks, impressions),
+        "cpc": metric_round(spend / clicks, 4) if clicks else (None if spend > 0 else 0),
+        "link_cpc": metric_round(spend / link_clicks, 4) if link_clicks else (None if spend > 0 else 0),
+        "cpm": metric_round(spend / impressions * 1000, 4) if impressions else (None if spend > 0 else 0),
+        "landing_page_views": metric_round(lpv, 2),
+        "cost_per_landing_page_view": metric_round(spend / lpv, 4) if lpv else (None if spend > 0 else 0),
+    }
+
+
+def v91_build_setup_portfolio(rows):
+    """Agrupa apenas setups iguais; não decide qual KPI cada grupo deve usar."""
+    groups = {}
+    total_spend = sum(safe_float(row.get("spend")) for row in rows)
+
+    for row in rows:
+        setup = row.get("meta_setup") or {}
+        signature = setup.get("setup_signature") or "account_or_unknown"
+        groups.setdefault(signature, []).append(row)
+
+    output = []
+    for signature, group_rows in groups.items():
+        first = group_rows[0]
+        setup = first.get("meta_setup") or {}
+        spend = sum(safe_float(row.get("spend")) for row in group_rows)
+        campaigns = {
+            row.get("campaign_id")
+            for row in group_rows
+            if row.get("campaign_id")
+        }
+        adsets = {
+            row.get("adset_id")
+            for row in group_rows
+            if row.get("adset_id")
+        }
+        output.append({
+            "setup_signature": signature,
+            "campaign_setup": setup.get("campaign"),
+            "adset_setup": setup.get("adset"),
+            "spend": metric_round(spend, 2),
+            "spend_share_pct": share_percent(spend, total_spend),
+            "campaign_count": len(campaigns),
+            "adset_count": len(adsets),
+            "available_action_types": sorted({
+                action_type
+                for row in group_rows
+                for action_type in (row.get("available_actions") or {}).keys()
+            })[:120],
+            "meta_result_examples": [
+                row.get("meta_reported_result")
+                for row in group_rows[:3]
+                if row.get("meta_reported_result")
+            ],
+        })
+
+    output.sort(key=lambda item: safe_float(item.get("spend")), reverse=True)
+    return {
+        "group_count": len(output),
+        "total_spend": metric_round(total_spend, 2),
+        "groups": output,
+        "rule": (
+            "Grupos refletem configurações retornadas pela Meta. O backend não atribui "
+            "um KPI fixo a nenhum grupo; a interpretação é feita pela IA a partir do setup real."
+        ),
+    }
+
+
+def v91_sort_rows(rows, sort_by, sort_order):
+    reverse = (sort_order or "desc").lower() == "desc"
+
+    def key(row):
+        value = row.get(sort_by)
+        if value is None:
+            return float("-inf") if reverse else float("inf")
+        return safe_float(value)
+
+    rows.sort(key=key, reverse=reverse)
+    return rows
+
+
+def query_meta_insights(
+    context,
+    since,
+    until,
+    level="account",
+    search=None,
+    limit=25,
+    sort_by="spend",
+    sort_order="desc",
+    min_spend=0,
+    include_zero_spend=True,
+    action_type=None,
+):
+    print("[V9.1] QUERY_META_DRIVEN_START", {
+        "since": since,
+        "until": until,
+        "level": level,
+        "search": search,
+        "sort_by": sort_by,
+        "action_type": action_type,
+    })
+
+    if level not in ALLOWED_LEVELS:
+        raise ValueError(f"Nível inválido: {level}")
+    if sort_by not in V91_BASE_SORT_METRICS:
+        raise ValueError(f"Métrica de ordenação inválida na v9.1: {sort_by}")
+    if sort_by in {"selected_action_value", "selected_action_cost"} and not action_type:
+        raise ValueError("Para ordenar por resultado dinâmico, informe action_type após inspecionar o setup da Meta.")
+    if (sort_order or "desc").lower() not in {"asc", "desc"}:
+        raise ValueError("sort_order deve ser asc ou desc.")
+
+    limit = max(1, min(int(limit or 25), 100))
+    min_spend = max(0.0, safe_float(min_spend))
+    today = get_today_for_context(context)
+    validate_date_range(since, until, today=today)
+
+    ad_account_id, access_token, credential_error = get_meta_credentials(context)
+    if credential_error:
+        raise RuntimeError(credential_error)
+
+    metadata = v91_fetch_setup_metadata(ad_account_id, access_token)
+    raw_rows, insight_fields_used = v91_fetch_raw_insights(
+        ad_account_id, access_token, since, until, level
+    )
+    rows = [
+        v91_normalize_insight_row(row, level, metadata, selected_action_type=action_type)
+        for row in raw_rows
+    ]
+
+    if search:
+        needle = normalize_text(str(search))
+        rows = [
+            row for row in rows
+            if needle in normalize_text(" ".join(
+                str(row.get(field) or "") for field in entity_fields_for_level(level)
+            ))
+        ]
+
+    rows = [row for row in rows if safe_float(row.get("spend")) >= min_spend]
+    if not include_zero_spend:
+        rows = [row for row in rows if safe_float(row.get("spend")) > 0]
+
+    # Para conta, buscamos adsets em paralelo para mostrar a composição real do setup.
+    # Isso evita fingir que a conta inteira possui um único objetivo.
+    setup_entities = []
+    if level == "account":
+        adset_raw, _ = v91_fetch_raw_insights(
+            ad_account_id, access_token, since, until, "adset"
+        )
+        setup_entities = [
+            v91_normalize_insight_row(
+                row, "adset", metadata, selected_action_type=action_type
+            )
+            for row in adset_raw
+        ]
+        setup_entities = [
+            row for row in setup_entities
+            if safe_float(row.get("spend")) >= min_spend
+            and (include_zero_spend or safe_float(row.get("spend")) > 0)
+        ]
+        setup_entities.sort(key=lambda item: safe_float(item.get("spend")), reverse=True)
+
+    v91_sort_rows(rows, sort_by, sort_order)
+    returned_rows = rows[:limit]
+
+    if level == "account" and returned_rows:
+        # O row de conta vem deduplicado pela Meta e é a melhor fonte para métricas globais.
+        summary = {
+            key: returned_rows[0].get(key)
+            for key in [
+                "spend", "impressions", "reach", "frequency", "clicks", "link_clicks",
+                "ctr", "link_ctr", "cpc", "link_cpc", "cpm", "landing_page_views",
+                "cost_per_landing_page_view",
+            ]
+        }
+        summary["meta_reported_result"] = returned_rows[0].get("meta_reported_result")
+        summary["available_actions"] = returned_rows[0].get("available_actions")
+        summary["available_cost_per_action"] = returned_rows[0].get("available_cost_per_action")
+        if action_type:
+            summary["selected_action_type"] = action_type
+            summary["selected_action_value"] = returned_rows[0].get("selected_action_value")
+            summary["selected_action_cost"] = returned_rows[0].get("selected_action_cost")
+    else:
+        summary = v91_aggregate_base(rows)
+        summary["available_actions_aggregated"] = v91_sum_action_catalogs(rows, "available_actions")
+        if action_type:
+            selected_value = sum(
+                safe_float(row.get("selected_action_value"))
+                for row in rows
+                if row.get("selected_action_found")
+            )
+            selected_cost = metric_round(
+                safe_float(summary.get("spend")) / selected_value, 4
+            ) if selected_value > 0 else None
+            summary["selected_action_type"] = action_type
+            summary["selected_action_value"] = metric_round(selected_value, 4)
+            summary["selected_action_cost_derived_for_selection"] = selected_cost
+
+    portfolio_source = setup_entities if level == "account" else rows
+    setup_portfolio = v91_build_setup_portfolio(portfolio_source)
+
+    result = {
+        "engine": ANALYSIS_ENGINE,
+        "period": {"since": since, "until": until},
+        "level": level,
+        "account_id": ad_account_id,
+        "matched_rows": len(rows),
+        "returned_rows": len(returned_rows),
+        "summary": summary,
+        "rows": returned_rows,
+        "setup_portfolio": setup_portfolio,
+        "setup_entities": setup_entities[:30] if level == "account" else None,
+        "meta_fields_used": {
+            "campaign_setup": metadata.get("fields_used", {}).get("campaign"),
+            "adset_setup": metadata.get("fields_used", {}).get("adset"),
+            "insights": insight_fields_used,
+        },
+        "interpretation_contract": {
+            "source_of_truth": "Meta Marketing API",
+            "do_not_assume_results_equals_leads": True,
+            "do_not_infer_kpi_from_campaign_name": True,
+            "first_choice": (
+                "Leia objective_results/cost_per_objective_result/cost_per_result quando a Meta os retornar."
+            ),
+            "fallback": (
+                "Se os campos contextualizados estiverem vazios, interprete objective + optimization_goal + "
+                "optimization_sub_event + promoted_object + destination_type e confronte com available_actions."
+            ),
+            "validation": (
+                "Ao escolher um action_type como resultado principal, use validar_resultado_meta antes de "
+                "tratar o evento como fato na resposta final."
+            ),
+        },
+    }
+    print("[V9.1] QUERY_META_DRIVEN_DONE", {
+        "rows": len(returned_rows),
+        "setup_groups": setup_portfolio.get("group_count"),
+        "action_type": action_type,
+    })
+    return result
+
+
+def validate_meta_result(
+    context,
+    since,
+    until,
+    level,
+    entity_id,
+    action_type,
+):
+    """
+    Valida uma interpretação feita pela IA sem possuir uma tabela de objetivos.
+    A IA escolhe o action_type; o backend confirma se a Meta realmente o retornou.
+    """
+    if level not in {"campaign", "adset", "ad"}:
+        raise ValueError("A validação de resultado exige level campaign, adset ou ad.")
+    if not entity_id or not action_type:
+        raise ValueError("entity_id e action_type são obrigatórios.")
+
+    report = query_meta_insights(
+        context,
+        since=since,
+        until=until,
+        level=level,
+        search=str(entity_id),
+        limit=100,
+        sort_by="spend",
+        sort_order="desc",
+        min_spend=0,
+        include_zero_spend=True,
+        action_type=str(action_type),
+    )
+
+    exact = None
+    for row in report.get("rows", []):
+        if str(entity_id_for_row(row, level)) == str(entity_id):
+            exact = row
+            break
+
+    if exact is None:
+        return {
+            "validated": False,
+            "reason": "entity_not_found",
+            "entity_id": entity_id,
+            "action_type": action_type,
+        }
+
+    found = bool(exact.get("selected_action_found"))
+    return {
+        "validated": found,
+        "entity_id": entity_id,
+        "entity_name": entity_name_for_row(exact, level),
+        "level": level,
+        "action_type": action_type,
+        "value": exact.get("selected_action_value"),
+        "cost_per_action": exact.get("selected_action_cost"),
+        "cost_source": exact.get("selected_action_cost_source"),
+        "spend": exact.get("spend"),
+        "meta_setup": exact.get("meta_setup"),
+        "meta_reported_result": exact.get("meta_reported_result"),
+        "available_action_types": sorted((exact.get("available_actions") or {}).keys())[:150],
+        "note": (
+            "validated=true significa apenas que esse action_type existe nos Insights retornados pela Meta. "
+            "A pertinência estratégica continua sendo uma interpretação do setup real."
+        ),
+    }
+
+
+def compare_meta_periods(
+    context,
+    mode,
+    level="account",
+    n_days=None,
+    period_a_since=None,
+    period_a_until=None,
+    period_b_since=None,
+    period_b_until=None,
+    period_a_label=None,
+    period_b_label=None,
+    search=None,
+    limit=25,
+    sort_by="spend",
+    action_type=None,
+):
+    periods = resolve_comparison_periods(
+        context,
+        mode,
+        n_days=n_days,
+        period_a_since=period_a_since,
+        period_a_until=period_a_until,
+        period_b_since=period_b_since,
+        period_b_until=period_b_until,
+        period_a_label=period_a_label,
+        period_b_label=period_b_label,
+    )
+
+    report_a = query_meta_insights(
+        context,
+        periods["a"]["since"], periods["a"]["until"],
+        level=level, search=search, limit=max(limit, 50), sort_by=sort_by,
+        sort_order="desc", include_zero_spend=True, action_type=action_type,
+    )
+    report_b = query_meta_insights(
+        context,
+        periods["b"]["since"], periods["b"]["until"],
+        level=level, search=search, limit=max(limit, 50), sort_by=sort_by,
+        sort_order="desc", include_zero_spend=True, action_type=action_type,
+    )
+
+    base_metrics = [
+        "spend", "impressions", "reach", "frequency", "clicks", "link_clicks",
+        "ctr", "link_ctr", "cpc", "link_cpc", "cpm", "landing_page_views",
+        "cost_per_landing_page_view",
+    ]
+    if action_type:
+        base_metrics += ["selected_action_value", "selected_action_cost"]
+
+    summary_deltas = {
+        metric: metric_delta(
+            report_a.get("summary", {}).get(metric),
+            report_b.get("summary", {}).get(metric),
+        )
+        for metric in base_metrics
+    }
+
+    entities = []
+    if level != "account":
+        rows_a = {
+            str(entity_id_for_row(row, level)): row
+            for row in report_a.get("rows", [])
+            if entity_id_for_row(row, level)
+        }
+        rows_b = {
+            str(entity_id_for_row(row, level)): row
+            for row in report_b.get("rows", [])
+            if entity_id_for_row(row, level)
+        }
+        for entity_id in set(rows_a) | set(rows_b):
+            a = rows_a.get(entity_id, {})
+            b = rows_b.get(entity_id, {})
+            base = b or a
+            sig_a = (a.get("meta_setup") or {}).get("setup_signature")
+            sig_b = (b.get("meta_setup") or {}).get("setup_signature")
+            setup_unchanged = not (sig_a and sig_b and sig_a != sig_b)
+            entities.append({
+                "id": entity_id,
+                "name": entity_name_for_row(base, level),
+                "setup_unchanged": setup_unchanged,
+                "period_a_setup": a.get("meta_setup"),
+                "period_b_setup": b.get("meta_setup"),
+                "period_a_meta_result": a.get("meta_reported_result"),
+                "period_b_meta_result": b.get("meta_reported_result"),
+                "period_a": {metric: a.get(metric) for metric in base_metrics},
+                "period_b": {metric: b.get(metric) for metric in base_metrics},
+                "deltas": {
+                    metric: metric_delta(a.get(metric), b.get(metric))
+                    for metric in base_metrics
+                },
+            })
+        entities.sort(
+            key=lambda item: safe_float(item.get("period_b", {}).get(sort_by)),
+            reverse=True,
+        )
+        entities = entities[:max(1, min(int(limit or 25), 50))]
+
+    return {
+        "engine": ANALYSIS_ENGINE,
+        "mode": mode,
+        "level": level,
+        "selected_action_type": action_type,
+        "period_a": {
+            **periods["a"],
+            "summary": report_a.get("summary"),
+            "setup_portfolio": report_a.get("setup_portfolio"),
+        },
+        "period_b": {
+            **periods["b"],
+            "summary": report_b.get("summary"),
+            "setup_portfolio": report_b.get("setup_portfolio"),
+        },
+        "summary_deltas_a_to_b": summary_deltas,
+        "entities": entities,
+        "guardrail": (
+            "Nenhum KPI principal foi escolhido pelo código. Compare a métrica compatível com o setup "
+            "retornado pela Meta; se usar action_type, valide-o. Se setup_unchanged=false, não atribua "
+            "a mudança apenas à performance, pois a configuração também mudou."
+        ),
+    }
+
+
+def list_meta_structure(context, level="campaign", search=None, limit=50):
+    """Lista a configuração REAL da Meta, sem mapear objetivo para KPI no código."""
+    if level not in {"campaign", "adset", "ad"}:
+        raise ValueError("level deve ser campaign, adset ou ad.")
+
+    ad_account_id, access_token, credential_error = get_meta_credentials(context)
+    if credential_error:
+        raise RuntimeError(credential_error)
+    metadata = v91_fetch_setup_metadata(ad_account_id, access_token)
+
+    if level == "campaign":
+        rows = []
+        for campaign_id, campaign in metadata.get("campaigns", {}).items():
+            children = metadata.get("adsets_by_campaign", {}).get(campaign_id, [])
+            variants = []
+            seen = set()
+            for adset in children:
+                signature = v91_setup_signature(campaign, adset)
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                variants.append({
+                    "setup_signature": signature,
+                    "adset_setup": v91_adset_setup_view(adset),
+                })
+            rows.append({
+                "id": campaign_id,
+                "name": campaign.get("name"),
+                "campaign_setup": v91_campaign_setup_view(campaign),
+                "adset_setup_variants": variants,
+                "setup_variant_count": len(variants),
+                "requires_adset_drilldown": len(variants) > 1,
+            })
+    elif level == "adset":
+        rows = []
+        for adset_id, adset in metadata.get("adsets", {}).items():
+            campaign = metadata.get("campaigns", {}).get(str(adset.get("campaign_id") or ""), {})
+            rows.append({
+                "id": adset_id,
+                "name": adset.get("name"),
+                "campaign_setup": v91_campaign_setup_view(campaign),
+                "adset_setup": v91_adset_setup_view(adset),
+                "setup_signature": v91_setup_signature(campaign, adset),
+            })
+    else:
+        # Para anúncios buscamos somente identidade/hierarquia e anexamos o setup do conjunto/campanha.
+        ads_url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{ad_account_id}/ads"
+        ads, _ = v91_meta_get_edge_with_fallback(
+            ads_url,
+            access_token,
+            [
+                ["id", "name", "campaign_id", "adset_id", "status", "effective_status", "conversion_specs", "tracking_specs"],
+                ["id", "name", "campaign_id", "adset_id", "status", "effective_status"],
+                ["id", "name", "campaign_id", "adset_id"],
+            ],
+            limit=500,
+            max_pages=20,
+        )
+        rows = []
+        for ad in ads:
+            campaign = metadata.get("campaigns", {}).get(str(ad.get("campaign_id") or ""), {})
+            adset = metadata.get("adsets", {}).get(str(ad.get("adset_id") or ""), {})
+            rows.append({
+                "id": ad.get("id"),
+                "name": ad.get("name"),
+                "status": ad.get("status"),
+                "effective_status": ad.get("effective_status"),
+                "conversion_specs": v91_json_safe(ad.get("conversion_specs")),
+                "tracking_specs": v91_json_safe(ad.get("tracking_specs")),
+                "campaign_setup": v91_campaign_setup_view(campaign),
+                "adset_setup": v91_adset_setup_view(adset),
+                "setup_signature": v91_setup_signature(campaign, adset),
+            })
+
+    if search:
+        needle = normalize_text(str(search))
+        rows = [
+            row for row in rows
+            if needle in normalize_text(f"{row.get('id', '')} {row.get('name', '')}")
+        ]
+
+    limit = max(1, min(int(limit or 50), 100))
+    return {
+        "engine": ANALYSIS_ENGINE,
+        "level": level,
+        "matched_rows": len(rows),
+        "rows": rows[:limit],
+        "rule": "Configuração exibida como a Meta retornou; nenhum KPI foi pré-definido pelo backend.",
+    }
+
+
+
+# =========================================================
+# V10 — ACTION AI / ESCRITA CONTROLADA NA META
+# =========================================================
+
+ACTION_TARGET_TYPES = {"campaign", "adset", "ad"}
+ZERO_DECIMAL_CURRENCIES = {"BIF", "CLP", "DJF", "GNF", "JPY", "KMF", "KRW", "MGA", "PYG", "RWF", "UGX", "VND", "VUV", "XAF", "XOF", "XPF"}
+
+ALLOWED_ADSET_UPDATE_FIELDS = {
+    "name", "targeting", "optimization_goal", "optimization_sub_event",
+    "billing_event", "promoted_object", "destination_type", "bid_amount",
+    "bid_strategy", "attribution_spec", "start_time", "end_time",
+    "daily_budget", "lifetime_budget",
+}
+
+
+def normalize_account_id(value):
+    value = str(value or "").strip()
+    return value[4:] if value.startswith("act_") else value
+
+
+def graph_payload(data):
+    output = {}
+    for key, value in (data or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, (dict, list)):
+            output[key] = json.dumps(value, ensure_ascii=False)
+        elif isinstance(value, bool):
+            output[key] = "true" if value else "false"
+        else:
+            output[key] = value
+    return output
+
+
+def meta_graph_get(context, path, fields=None, params=None, timeout=30):
+    ad_account_id, access_token, error = get_meta_credentials(context)
+    if error:
+        raise RuntimeError(error)
+    query = dict(params or {})
+    if fields:
+        query["fields"] = fields
+    proof = appsecret_proof(access_token)
+    if proof:
+        query["appsecret_proof"] = proof
+    response = requests.get(
+        f"https://graph.facebook.com/{GRAPH_API_VERSION}/{path}",
+        params=query,
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=timeout,
+    )
+    if response.status_code >= 300:
+        raise RuntimeError(f"Meta GET {path}: {response.status_code} {response.text}")
+    return response.json()
+
+
+def meta_graph_post(context, path, data=None, timeout=45):
+    ad_account_id, access_token, error = get_meta_credentials(context)
+    if error:
+        raise RuntimeError(error)
+    payload = graph_payload(data)
+    proof = appsecret_proof(access_token)
+    if proof:
+        payload["appsecret_proof"] = proof
+    response = requests.post(
+        f"https://graph.facebook.com/{GRAPH_API_VERSION}/{path}",
+        data=payload,
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=timeout,
+    )
+    if response.status_code >= 300:
+        raise RuntimeError(f"Meta POST {path}: {response.status_code} {response.text}")
+    return response.json()
+
+
+def ensure_target_belongs_to_account(context, target_type, target_id):
+    if target_type not in ACTION_TARGET_TYPES:
+        raise ValueError("Tipo de alvo inválido.")
+    if not target_id:
+        raise ValueError("ID do alvo ausente.")
+    data = meta_graph_get(context, str(target_id), fields="id,account_id")
+    selected = normalize_account_id(context.get("ad_account_id"))
+    target_account = normalize_account_id(data.get("account_id"))
+    if target_account and selected and target_account != selected:
+        raise PermissionError("Esse objeto não pertence à conta Meta selecionada.")
+    return data
+
+
+def currency_to_minor(context, amount_major):
+    amount = float(amount_major)
+    if amount <= 0:
+        raise ValueError("O orçamento precisa ser maior que zero.")
+    currency = str(context.get("meta_currency") or "BRL").upper()
+    multiplier = 1 if currency in ZERO_DECIMAL_CURRENCIES else 100
+    return int(round(amount * multiplier))
+
+
+def is_explicit_confirmation_text(text):
+    n = normalize_text(text or "")
+    negative = ["nao", "não", "cancela", "cancelar", "deixa", "nao faca", "não faça"]
+    if any(term in n for term in negative):
+        return False
+    confirmations = [
+        "sim", "confirmo", "confirmar", "pode fazer", "pode executar", "faca", "faça",
+        "faz isso", "execute", "pode ativar", "ativa", "ative", "manda bala", "pode",
+    ]
+    return any(term in n for term in confirmations)
+
+
+def is_explicit_creation_request(text):
+    n = normalize_text(text or "")
+    negatives = ["nao crie", "não crie", "nao criar", "não criar"]
+    if any(x in n for x in negatives):
+        return False
+    return any(x in n for x in ["crie", "criar", "cria", "monte", "montar", "nova campanha", "quero uma campanha"])
+
+
+def action_summary(action_type, target_type, target_id, spec, summary=None):
+    if summary:
+        return summary.strip()
+    if action_type == "set_status":
+        return f"Alterar {target_type} {target_id} para {spec.get('status')}."
+    if action_type == "set_budget":
+        return f"Alterar orçamento de {target_type} {target_id} para {spec.get('amount_major')} {spec.get('budget_kind', 'daily_budget')}."
+    if action_type == "duplicate":
+        return f"Duplicar {target_type} {target_id} mantendo a cópia pausada."
+    if action_type == "create_pixel":
+        return f"Criar Pixel '{spec.get('name')}'."
+    if action_type == "update_adset":
+        return f"Atualizar configurações do conjunto {target_id}."
+    if action_type == "activate_structure":
+        return "Ativar a estrutura de campanha que foi criada pausada."
+    return f"Executar {action_type}."
+
+
+def validate_action_request(context, action_type, target_type=None, target_id=None, spec=None):
+    spec = dict(spec or {})
+    if not ACTION_AI_ENABLED:
+        raise RuntimeError("Action AI está desativitado no ambiente.")
+    if not context.get("can_create_campaigns"):
+        raise PermissionError("Este usuário não possui permissão de escrita na Meta.")
+
+    if action_type in {"set_status", "set_budget", "duplicate", "update_adset"}:
+        ensure_target_belongs_to_account(context, target_type, target_id)
+
+    if action_type == "set_status":
+        status = str(spec.get("status") or "").upper()
+        if status not in {"ACTIVE", "PAUSED"}:
+            raise ValueError("Status permitido: ACTIVE ou PAUSED.")
+        spec["status"] = status
+
+    elif action_type == "set_budget":
+        if target_type not in {"campaign", "adset"}:
+            raise ValueError("Orçamento pode ser alterado em campaign ou adset.")
+        kind = spec.get("budget_kind", "daily_budget")
+        if kind not in {"daily_budget", "lifetime_budget"}:
+            raise ValueError("budget_kind inválido.")
+        spec["amount_major"] = float(spec.get("amount_major"))
+        spec["budget_kind"] = kind
+
+    elif action_type == "duplicate":
+        if target_type not in ACTION_TARGET_TYPES:
+            raise ValueError("Só é possível duplicar campaign/adset/ad.")
+        spec["deep_copy"] = bool(spec.get("deep_copy", True))
+
+    elif action_type == "create_pixel":
+        name = str(spec.get("name") or "").strip()
+        if not name:
+            raise ValueError("Informe o nome do Pixel.")
+        spec["name"] = name
+
+    elif action_type == "update_adset":
+        if target_type != "adset":
+            raise ValueError("update_adset exige target_type=adset.")
+        updates = dict(spec.get("updates") or {})
+        forbidden = set(updates) - ALLOWED_ADSET_UPDATE_FIELDS
+        if forbidden:
+            raise ValueError("Campos de conjunto não permitidos: " + ", ".join(sorted(forbidden)))
+        if not updates:
+            raise ValueError("Nenhuma alteração de conjunto foi informada.")
+        # Status e orçamento têm fluxos próprios para deixar o risco evidente.
+        updates.pop("status", None)
+        spec["updates"] = updates
+
+    elif action_type == "activate_structure":
+        ids = dict(spec.get("ids") or {})
+        if not ids.get("campaign_id"):
+            raise ValueError("Estrutura sem campaign_id.")
+        ensure_target_belongs_to_account(context, "campaign", ids["campaign_id"])
+        spec["ids"] = ids
+
+    else:
+        raise ValueError(f"Ação não suportada: {action_type}")
+
+    return spec
+
+
+def create_pending_action(context, action_type, target_type=None, target_id=None, spec=None, summary=None):
+    spec = validate_action_request(context, action_type, target_type, target_id, spec)
+    action_key = uuid.uuid4().hex
+    summary = action_summary(action_type, target_type, target_id, spec, summary)
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO pending_actions (
+                    action_key, company_id, user_id, ad_account_id,
+                    action_type, target_type, target_id, spec, summary,
+                    status, requires_confirmation
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, 'PENDING_CONFIRMATION', TRUE)
+                RETURNING id, action_key, created_at;
+                """,
+                (
+                    action_key,
+                    context["company_id"], context["user_id"], context["ad_account_id"],
+                    action_type, target_type, target_id,
+                    json.dumps(spec, ensure_ascii=False), summary,
+                ),
+            )
+            row = cursor.fetchone()
+    log_activity(context, "action_proposed", {"action_id": row["id"], "action_type": action_type, "target_type": target_type, "target_id": target_id})
+    return {
+        "action_id": row["id"],
+        "action_key": row["action_key"],
+        "status": "PENDING_CONFIRMATION",
+        "summary": summary,
+        "confirmation_required": True,
+        "confirmation_text": "A ação ainda NÃO foi executada. Peça uma confirmação simples, por exemplo: 'Posso executar?'.",
+    }
+
+
+def get_pending_action(context, action_id=None):
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            if action_id:
+                cursor.execute(
+                    """
+                    SELECT * FROM pending_actions
+                    WHERE id = %s AND company_id = %s AND user_id = %s;
+                    """,
+                    (int(action_id), context["company_id"], context["user_id"]),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT * FROM pending_actions
+                    WHERE company_id = %s AND user_id = %s AND status = 'PENDING_CONFIRMATION'
+                    ORDER BY created_at DESC LIMIT 1;
+                    """,
+                    (context["company_id"], context["user_id"]),
+                )
+            return cursor.fetchone()
+
+
+def execute_action_spec(context, action):
+    action_type = action["action_type"]
+    target_type = action.get("target_type")
+    target_id = action.get("target_id")
+    spec = validate_action_request(context, action_type, target_type, target_id, action.get("spec") or {})
+
+    if action_type == "set_status":
+        result = meta_graph_post(context, str(target_id), {"status": spec["status"]})
+        return {"target_type": target_type, "target_id": target_id, "status": spec["status"], "meta": result}
+
+    if action_type == "set_budget":
+        amount_minor = currency_to_minor(context, spec["amount_major"])
+        result = meta_graph_post(context, str(target_id), {spec["budget_kind"]: amount_minor})
+        return {
+            "target_type": target_type, "target_id": target_id,
+            "budget_kind": spec["budget_kind"], "amount_major": spec["amount_major"],
+            "amount_minor": amount_minor, "currency": context.get("meta_currency") or "BRL", "meta": result,
+        }
+
+    if action_type == "duplicate":
+        payload = {"status_option": "PAUSED"}
+        if target_type in {"campaign", "adset"}:
+            payload["deep_copy"] = bool(spec.get("deep_copy", True))
+        if spec.get("rename_options"):
+            payload["rename_options"] = spec["rename_options"]
+        result = meta_graph_post(context, f"{target_id}/copies", payload)
+        return {"target_type": target_type, "source_id": target_id, "copy_status": "PAUSED", "meta": result}
+
+    if action_type == "create_pixel":
+        account_path = context["ad_account_id"]
+        result = meta_graph_post(context, f"{account_path}/adspixels", {"name": spec["name"]})
+        return {"name": spec["name"], "pixel_id": result.get("id"), "meta": result}
+
+    if action_type == "update_adset":
+        result = meta_graph_post(context, str(target_id), spec["updates"])
+        return {"target_id": target_id, "updated_fields": sorted(spec["updates"].keys()), "meta": result}
+
+    if action_type == "activate_structure":
+        ids = spec["ids"]
+        results = []
+        # Ordem superior -> inferior. Se um nível ainda estiver em revisão, effective_status refletirá isso.
+        for entity_type, key in [("campaign", "campaign_id"), ("adset", "adset_id")]:
+            entity_id = ids.get(key)
+            if entity_id:
+                ensure_target_belongs_to_account(context, entity_type, entity_id)
+                results.append({entity_type: meta_graph_post(context, str(entity_id), {"status": "ACTIVE"})})
+        for ad_id in ids.get("ad_ids") or []:
+            ensure_target_belongs_to_account(context, "ad", ad_id)
+            results.append({"ad": meta_graph_post(context, str(ad_id), {"status": "ACTIVE"})})
+        return {"activated": ids, "meta_results": results}
+
+    raise ValueError("Ação sem executor.")
+
+
+def confirm_pending_action(context, action_id=None):
+    user_text = context.get("_current_user_text") or ""
+    if not is_explicit_confirmation_text(user_text):
+        return {
+            "executed": False,
+            "reason": "A mensagem atual não contém uma confirmação explícita.",
+            "instruction": "Peça ao cliente para responder algo como 'pode fazer' ou 'pode ativar'.",
+        }
+
+    action = get_pending_action(context, action_id)
+    if not action:
+        return {"executed": False, "reason": "Não existe ação pendente para este cliente."}
+    if action["status"] != "PENDING_CONFIRMATION":
+        return {"executed": False, "reason": f"Ação está em {action['status']}."}
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE pending_actions
+                SET status = 'EXECUTING', confirmed_at = NOW()
+                WHERE id = %s AND status = 'PENDING_CONFIRMATION'
+                RETURNING id;
+                """,
+                (action["id"],),
+            )
+            if not cursor.fetchone():
+                return {"executed": False, "reason": "A ação já foi processada por outra execução."}
+
+    try:
+        result = execute_action_spec(context, action)
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE pending_actions
+                    SET status='EXECUTED', executed_at=NOW(), result=%s::jsonb, error=NULL
+                    WHERE id=%s;
+                    """,
+                    (json.dumps(result, ensure_ascii=False, default=str), action["id"]),
+                )
+        log_activity(context, "action_executed", {"action_id": action["id"], "action_type": action["action_type"]})
+        return {"executed": True, "action_id": action["id"], "summary": action.get("summary"), "result": result}
+    except Exception as error:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE pending_actions SET status='FAILED', error=%s WHERE id=%s;",
+                    (str(error), action["id"]),
+                )
+        log_activity(context, "action_failed", {"action_id": action["id"], "error": str(error)})
+        raise
+
+
+def cancel_pending_action(context, action_id=None):
+    action = get_pending_action(context, action_id)
+    if not action:
+        return {"cancelled": False, "reason": "Nenhuma ação pendente encontrada."}
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE pending_actions SET status='CANCELLED'
+                WHERE id=%s AND company_id=%s AND user_id=%s AND status='PENDING_CONFIRMATION';
+                """,
+                (action["id"], context["company_id"], context["user_id"]),
+            )
+    return {"cancelled": True, "action_id": action["id"], "summary": action.get("summary")}
+
+
+def list_pending_actions(context):
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, action_type, target_type, target_id, summary, status, created_at
+                FROM pending_actions
+                WHERE company_id=%s AND user_id=%s
+                ORDER BY created_at DESC LIMIT 10;
+                """,
+                (context["company_id"], context["user_id"]),
+            )
+            return cursor.fetchall()
+
+
+def list_pixels(context):
+    account_path = context["ad_account_id"]
+    data = meta_graph_get(context, f"{account_path}/adspixels", fields="id,name,creation_time,last_fired_time", params={"limit": 100})
+    return data.get("data", [])
+
+
+def register_ad_review_watch(context, campaign_id, adset_id, ad_id, ad_name):
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO ad_review_watch (
+                    company_id, user_id, whatsapp_number, ad_account_id,
+                    campaign_id, adset_id, ad_id, ad_name, active, updated_at
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,TRUE,NOW())
+                ON CONFLICT (company_id, ad_id) DO UPDATE SET
+                    user_id=EXCLUDED.user_id,
+                    whatsapp_number=EXCLUDED.whatsapp_number,
+                    ad_account_id=EXCLUDED.ad_account_id,
+                    campaign_id=EXCLUDED.campaign_id,
+                    adset_id=EXCLUDED.adset_id,
+                    ad_name=EXCLUDED.ad_name,
+                    active=TRUE,
+                    updated_at=NOW();
+                """,
+                (
+                    context["company_id"], context["user_id"], context["whatsapp_number"],
+                    context["ad_account_id"], campaign_id, adset_id, ad_id, ad_name,
+                ),
+            )
+
+
+def create_paused_structure(context, campaign, adset=None, ads=None):
+    if not ACTION_AI_ENABLED:
+        raise RuntimeError("Action AI está desativado.")
+    if not context.get("can_create_campaigns"):
+        raise PermissionError("Usuário sem permissão para criar campanhas.")
+    if not is_explicit_creation_request(context.get("_current_user_text")):
+        return {
+            "created": False,
+            "reason": "A criação só pode ocorrer quando o cliente pede explicitamente para criar/montar a campanha.",
+        }
+
+    campaign = dict(campaign or {})
+    campaign_name = str(campaign.get("name") or "").strip()
+    objective = str(campaign.get("objective") or "").strip()
+    if not campaign_name or not objective:
+        return {
+            "created": False,
+            "missing": [x for x, value in [("campaign.name", campaign_name), ("campaign.objective", objective)] if not value],
+            "instruction": "Pergunte somente as informações faltantes em linguagem simples.",
+        }
+
+    campaign_payload = dict(campaign)
+    campaign_payload["name"] = campaign_name
+    campaign_payload["objective"] = objective
+    campaign_payload["status"] = "PAUSED"
+    campaign_payload.setdefault("buying_type", "AUCTION")
+    campaign_payload.setdefault("special_ad_categories", [])
+    campaign_payload.setdefault("is_adset_budget_sharing_enabled", False)
+
+    created = {"campaign_id": None, "adset_id": None, "ad_ids": [], "creative_ids": []}
+    try:
+        campaign_result = meta_graph_post(context, f"{context['ad_account_id']}/campaigns", campaign_payload)
+        campaign_id = campaign_result.get("id")
+        if not campaign_id:
+            raise RuntimeError("Meta não retornou campaign_id.")
+        created["campaign_id"] = campaign_id
+
+        adset_id = None
+        adset_payload = None
+        if adset:
+            adset_payload = dict(adset)
+            adset_payload["campaign_id"] = campaign_id
+            adset_payload["status"] = "PAUSED"
+            if not adset_payload.get("name"):
+                raise ValueError("adset.name é obrigatório para criar o conjunto.")
+            adset_result = meta_graph_post(context, f"{context['ad_account_id']}/adsets", adset_payload)
+            adset_id = adset_result.get("id")
+            if not adset_id:
+                raise RuntimeError("Meta não retornou adset_id.")
+            created["adset_id"] = adset_id
+
+        for ad_spec in (ads or []):
+            if not adset_id:
+                raise ValueError("Não é possível criar anúncio sem conjunto de anúncios.")
+            ad_spec = dict(ad_spec or {})
+            ad_name = str(ad_spec.get("name") or "").strip()
+            if not ad_name:
+                raise ValueError("Cada anúncio precisa de name.")
+
+            creative_id = ad_spec.get("creative_id")
+            creative_payload = ad_spec.get("creative")
+            if creative_payload:
+                creative_payload = dict(creative_payload)
+                creative_payload.setdefault("name", f"Creative - {ad_name}")
+                creative_result = meta_graph_post(context, f"{context['ad_account_id']}/adcreatives", creative_payload)
+                creative_id = creative_result.get("id")
+                if creative_id:
+                    created["creative_ids"].append(creative_id)
+            if not creative_id:
+                raise ValueError(
+                    f"O anúncio '{ad_name}' precisa de creative_id ou creative com os dados que a Meta exige."
+                )
+
+            ad_payload = {
+                "name": ad_name,
+                "adset_id": adset_id,
+                "creative": {"creative_id": creative_id},
+                "status": "PAUSED",
+            }
+            for optional_key in ["tracking_specs", "conversion_domain", "adlabels"]:
+                if ad_spec.get(optional_key) is not None:
+                    ad_payload[optional_key] = ad_spec[optional_key]
+            ad_result = meta_graph_post(context, f"{context['ad_account_id']}/ads", ad_payload)
+            ad_id = ad_result.get("id")
+            if not ad_id:
+                raise RuntimeError(f"Meta não retornou ad_id para {ad_name}.")
+            created["ad_ids"].append(ad_id)
+            register_ad_review_watch(context, campaign_id, adset_id, ad_id, ad_name)
+
+        # A criação pausada já foi explicitamente solicitada pelo cliente.
+        # A ativação, por outro lado, fica obrigatoriamente pendente de confirmação.
+        activation = create_pending_action(
+            context,
+            action_type="activate_structure",
+            target_type="campaign",
+            target_id=campaign_id,
+            spec={"ids": created},
+            summary=f"Ativar a campanha '{campaign_name}' e sua estrutura criada pausada.",
+        )
+
+        log_activity(context, "paused_structure_created", {"created": created, "activation_action_id": activation["action_id"]})
+
+        adset_summary = adset_payload or {}
+        return {
+            "created": True,
+            "status": "PAUSED",
+            "created_ids": created,
+            "activation_action_id": activation["action_id"],
+            "campaign_summary": {
+                "name": campaign_name,
+                "objective": objective,
+                "buying_type": campaign_payload.get("buying_type"),
+                "bid_strategy": campaign_payload.get("bid_strategy"),
+            },
+            "adset_summary": {
+                "name": adset_summary.get("name"),
+                "daily_budget": adset_summary.get("daily_budget"),
+                "lifetime_budget": adset_summary.get("lifetime_budget"),
+                "optimization_goal": adset_summary.get("optimization_goal"),
+                "billing_event": adset_summary.get("billing_event"),
+                "targeting": adset_summary.get("targeting"),
+                "start_time": adset_summary.get("start_time"),
+                "end_time": adset_summary.get("end_time"),
+                "promoted_object": adset_summary.get("promoted_object"),
+                "destination_type": adset_summary.get("destination_type"),
+            },
+            "ads_summary": [
+                {"name": a.get("name"), "creative_id": a.get("creative_id"), "has_new_creative": bool(a.get("creative"))}
+                for a in (ads or [])
+            ],
+            "mandatory_user_message": (
+                "✅ CAMPANHA CRIADA\n\n"
+                "A estrutura foi criada na Meta e está PAUSADA.\n\n"
+                "⚠️ SUA CAMPANHA ESTÁ CRIADA, PORÉM PAUSADA.\n"
+                "É preciso que você confirme para que eu possa colocá-la em veiculação.\n\n"
+                "Você pode responder: Pode ativar."
+            ),
+        }
+    except Exception as error:
+        log_activity(context, "paused_structure_creation_failed", {"partial_created": created, "error": str(error)})
+        return {
+            "created": False,
+            "partial_created": created,
+            "error": str(error),
+            "important": "Qualquer objeto criado antes do erro permanece PAUSADO. Não ative nada automaticamente.",
+        }
+
+
+def get_meta_credentials_for_company_account(company_id, ad_account_id):
+    initialize_database()
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT c.slug AS company_slug, m.ad_account_id, m.connection_id,
+                       mc.encrypted_access_token, mc.token_expires_at, mc.active AS connection_active
+                FROM companies c
+                JOIN meta_accounts m ON m.company_id=c.id
+                LEFT JOIN meta_connections mc ON mc.id=m.connection_id
+                WHERE c.id=%s AND m.ad_account_id=%s AND m.active=TRUE
+                LIMIT 1;
+                """,
+                (company_id, ad_account_id),
+            )
+            row = cursor.fetchone()
+    if not row:
+        return None, "Conta Meta não encontrada para a empresa."
+    if row.get("connection_id"):
+        if not row.get("connection_active"):
+            return None, "Conexão Meta inativa."
+        expires_at = row.get("token_expires_at")
+        if expires_at and expires_at <= datetime.now(timezone.utc):
+            return None, "Autorização Meta expirada."
+        return decrypt_token(row["encrypted_access_token"]), None
+    if row.get("company_slug") == "principal" and META_ADS_ACCESS_TOKEN and ad_account_id == META_AD_ACCOUNT_ID:
+        return META_ADS_ACCESS_TOKEN, None
+    return None, "Token Meta indisponível."
+
+
+def review_status_message(ad_name, status, feedback=None, issues=None):
+    name = ad_name or "Anúncio"
+    if status in {"ACTIVE", "PREAPPROVED"}:
+        return (
+            "✅ ANÚNCIO APROVADO\n\n"
+            f"A Meta aprovou o anúncio: {name}.\n\n"
+            "Se a estrutura ainda estiver pausada, ela continuará sem gastar até você autorizar a ativação."
+        )
+    if status == "DISAPPROVED":
+        details = feedback or issues
+        details_text = json.dumps(details, ensure_ascii=False, default=str) if details else "A Meta não informou um motivo detalhado nesta consulta."
+        return (
+            "❌ ANÚNCIO REPROVADO\n\n"
+            f"A Meta reprovou o anúncio: {name}.\n\n"
+            f"Motivo/feedback disponível: {details_text}\n\n"
+            "Posso analisar o problema e sugerir a correção."
+        )
+    if status == "WITH_ISSUES":
+        return (
+            "⚠️ ANÚNCIO COM PROBLEMA\n\n"
+            f"A Meta sinalizou um problema no anúncio: {name}.\n\n"
+            "Posso consultar os detalhes e orientar a correção."
+        )
+    return None
+
+
+def notify_review_state(row, status, feedback, issues):
+    message = review_status_message(row.get("ad_name"), status, feedback, issues)
+    if not message:
+        return False
+
+    context = {"company_id": row["company_id"], "user_id": row.get("user_id")}
+    last_inbound = row.get("last_inbound_at")
+    inside_window = bool(last_inbound and last_inbound >= datetime.now(timezone.utc) - timedelta(hours=23))
+
+    if inside_window:
+        response = send_whatsapp_message(row["whatsapp_number"], message)
+        return bool(response is not None and response.status_code < 300)
+
+    template = None
+    if status in {"ACTIVE", "PREAPPROVED"}:
+        template = WHATSAPP_REVIEW_APPROVED_TEMPLATE
+    elif status in {"DISAPPROVED", "WITH_ISSUES"}:
+        template = WHATSAPP_REVIEW_REJECTED_TEMPLATE
+
+    if template:
+        response = send_whatsapp_template(row["whatsapp_number"], template)
+        queue_pending_notification(context, row["whatsapp_number"], "review_detail", message)
+        return bool(response is not None and response.status_code < 300)
+
+    # Sem template aprovado não é permitido iniciar texto livre fora da janela.
+    # Guardamos o detalhe para a próxima mensagem do cliente.
+    queue_pending_notification(context, row["whatsapp_number"], "review_detail", message)
+    print("[V10] REVIEW_NOTIFICATION_QUEUED_NO_TEMPLATE", {"ad_id": row["ad_id"], "status": status})
+    return False
+
+
+def review_watcher_loop():
+    """Um único worker por banco segura advisory lock e monitora revisão de anúncios."""
+    if not REVIEW_WATCH_ENABLED:
+        return
+    while True:
+        lock_conn = None
+        try:
+            lock_conn = psycopg.connect(DATABASE_URL, autocommit=True, row_factory=dict_row)
+            with lock_conn.cursor() as cursor:
+                cursor.execute("SELECT pg_try_advisory_lock(910202610) AS acquired;")
+                acquired = bool(cursor.fetchone()["acquired"])
+            if not acquired:
+                lock_conn.close()
+                time.sleep(REVIEW_WATCH_INTERVAL_SECONDS)
+                continue
+
+            print("[V10] REVIEW_WATCHER_LEADER")
+            while REVIEW_WATCH_ENABLED:
+                try:
+                    with get_db_connection() as conn:
+                        with conn.cursor() as cursor:
+                            cursor.execute(
+                                """
+                                SELECT w.*, u.last_inbound_at
+                                FROM ad_review_watch w
+                                LEFT JOIN users u ON u.id=w.user_id
+                                WHERE w.active=TRUE
+                                ORDER BY w.updated_at ASC
+                                LIMIT 100;
+                                """
+                            )
+                            watches = cursor.fetchall()
+
+                    for row in watches:
+                        token, token_error = get_meta_credentials_for_company_account(row["company_id"], row["ad_account_id"])
+                        if token_error:
+                            print("[V10] REVIEW_TOKEN_ERROR", row["ad_id"], token_error)
+                            continue
+                        params = {
+                            "fields": "id,name,effective_status,configured_status,ad_review_feedback,issues_info",
+                        }
+                        proof = appsecret_proof(token)
+                        if proof:
+                            params["appsecret_proof"] = proof
+                        response = requests.get(
+                            f"https://graph.facebook.com/{GRAPH_API_VERSION}/{row['ad_id']}",
+                            params=params,
+                            headers={"Authorization": f"Bearer {token}"},
+                            timeout=30,
+                        )
+                        if response.status_code >= 300:
+                            print("[V10] REVIEW_META_ERROR", row["ad_id"], response.status_code, response.text)
+                            continue
+                        data = response.json()
+                        status = data.get("effective_status")
+                        feedback = data.get("ad_review_feedback")
+                        issues = data.get("issues_info")
+                        state_key = status if status in {"ACTIVE", "PREAPPROVED", "DISAPPROVED", "WITH_ISSUES"} else None
+
+                        if state_key and row.get("notified_state") != state_key:
+                            notified = notify_review_state(row, status, feedback, issues)
+                            # Mesmo sem template, marcamos estado como processado porque a mensagem detalhada foi enfileirada.
+                            processed_state = state_key
+                        else:
+                            processed_state = row.get("notified_state")
+
+                        with get_db_connection() as conn:
+                            with conn.cursor() as cursor:
+                                cursor.execute(
+                                    """
+                                    UPDATE ad_review_watch
+                                    SET last_effective_status=%s,
+                                        last_review_feedback=%s::jsonb,
+                                        last_issues_info=%s::jsonb,
+                                        notified_state=%s,
+                                        updated_at=NOW()
+                                    WHERE id=%s;
+                                    """,
+                                    (
+                                        status,
+                                        json.dumps(feedback, ensure_ascii=False, default=str) if feedback is not None else None,
+                                        json.dumps(issues, ensure_ascii=False, default=str) if issues is not None else None,
+                                        processed_state,
+                                        row["id"],
+                                    ),
+                                )
+                except Exception as cycle_error:
+                    print("[V10] REVIEW_WATCH_CYCLE_ERROR", repr(cycle_error))
+                    traceback.print_exc()
+                time.sleep(REVIEW_WATCH_INTERVAL_SECONDS)
+        except Exception as error:
+            print("[V10] REVIEW_WATCHER_ERROR", repr(error))
+            time.sleep(REVIEW_WATCH_INTERVAL_SECONDS)
+        finally:
+            if lock_conn:
+                try:
+                    lock_conn.close()
+                except Exception:
+                    pass
+
+
+def ensure_review_watcher_started():
+    global review_watcher_started
+    if not REVIEW_WATCH_ENABLED:
+        return
+    with review_watcher_lock:
+        if review_watcher_started:
+            return
+        thread = threading.Thread(target=review_watcher_loop, daemon=True, name="meta-review-watcher")
+        thread.start()
+        review_watcher_started = True
+        print("[V10] REVIEW_WATCHER_THREAD_STARTED")
+
+
+def consult_review_status(context, search=None):
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            if search:
+                cursor.execute(
+                    """
+                    SELECT ad_id, ad_name, campaign_id, adset_id, last_effective_status,
+                           last_review_feedback, last_issues_info, updated_at
+                    FROM ad_review_watch
+                    WHERE company_id=%s AND (ad_name ILIKE %s OR ad_id=%s)
+                    ORDER BY updated_at DESC LIMIT 30;
+                    """,
+                    (context["company_id"], f"%{search}%", search),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT ad_id, ad_name, campaign_id, adset_id, last_effective_status,
+                           last_review_feedback, last_issues_info, updated_at
+                    FROM ad_review_watch
+                    WHERE company_id=%s
+                    ORDER BY updated_at DESC LIMIT 30;
+                    """,
+                    (context["company_id"],),
+                )
+            return cursor.fetchall()
+
+
+ACTION_AI_TOOLS = [
+    {
+        "type": "function",
+        "name": "propor_acao_meta",
+        "description": (
+            "Cria uma ação pendente que ainda NÃO altera a Meta. Use para pausar/reativar, mudar orçamento, "
+            "duplicar, alterar público/posicionamentos/otimização de conjunto ou criar Pixel. Sempre peça confirmação depois."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action_type": {"type": "string", "enum": ["set_status", "set_budget", "duplicate", "update_adset", "create_pixel"]},
+                "target_type": {"type": ["string", "null"], "enum": ["campaign", "adset", "ad", None]},
+                "target_id": {"type": ["string", "null"]},
+                "spec": {"type": "object", "additionalProperties": True},
+                "summary": {"type": ["string", "null"]},
+            },
+            "required": ["action_type", "spec"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "confirmar_acao_pendente",
+        "description": "Executa uma ação pendente SOMENTE quando a mensagem atual do cliente contém confirmação explícita.",
+        "parameters": {
+            "type": "object",
+            "properties": {"action_id": {"type": ["integer", "null"]}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "cancelar_acao_pendente",
+        "description": "Cancela a ação pendente mais recente ou um action_id específico.",
+        "parameters": {
+            "type": "object",
+            "properties": {"action_id": {"type": ["integer", "null"]}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "listar_acoes_pendentes",
+        "description": "Lista ações propostas/executadas recentemente para evitar confusão em confirmações.",
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "type": "function",
+        "name": "criar_estrutura_pausada",
+        "description": (
+            "Quando o cliente pedir explicitamente uma nova campanha, cria campaign, adset e anúncios na Meta sempre PAUSED. "
+            "Depois cria automaticamente uma ação pendente separada para ativação. Nunca use em uma mera recomendação."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "campaign": {"type": "object", "additionalProperties": True},
+                "adset": {"type": ["object", "null"], "additionalProperties": True},
+                "ads": {
+                    "type": "array",
+                    "items": {"type": "object", "additionalProperties": True},
+                },
+            },
+            "required": ["campaign"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "listar_pixels",
+        "description": "Lista os Pixels/fontes AdsPixel vinculados à conta selecionada.",
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "type": "function",
+        "name": "consultar_revisao_anuncios",
+        "description": "Consulta o status de revisão monitorado dos anúncios criados pela ferramenta.",
+        "parameters": {
+            "type": "object",
+            "properties": {"search": {"type": ["string", "null"]}},
+            "additionalProperties": False,
+        },
+    },
+]
+
+DYNAMIC_ANALYSIS_TOOLS = [
+    {
+        "type": "function",
+        "name": "consultar_insights",
+        "description": (
+            "Consulta Insights e o setup real da Meta. Retorna objective/optimization_goal, campos "
+            "contextuais de resultado da própria Meta e catálogos de actions/cost_per_action_type. "
+            "Não pressupõe que resultado seja lead e não escolhe KPI por tabela fixa."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "since": {"type": "string", "description": "Data inicial inclusiva YYYY-MM-DD."},
+                "until": {"type": "string", "description": "Data final inclusiva YYYY-MM-DD."},
+                "level": {"type": "string", "enum": ["account", "campaign", "adset", "ad"]},
+                "search": {"type": ["string", "null"]},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "sort_by": {"type": "string", "enum": sorted(V91_BASE_SORT_METRICS)},
+                "sort_order": {"type": "string", "enum": ["asc", "desc"]},
+                "min_spend": {"type": "number", "minimum": 0},
+                "include_zero_spend": {"type": "boolean"},
+                "action_type": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "Use somente depois de identificar nos dados um action_type pertinente ao setup. "
+                        "O backend extrairá e validará esse evento sem possuir uma tabela fixa."
+                    ),
+                },
+            },
+            "required": ["since", "until", "level"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "comparar_periodos",
+        "description": (
+            "Compara períodos preservando o setup real retornado pela Meta. Não cria CPL/KPI universal. "
+            "Pode comparar um action_type escolhido após inspeção do setup."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "mode": {"type": "string", "enum": ["current_month_vs_previous_equivalent", "last_n_days_vs_previous_n_days", "custom"]},
+                "level": {"type": "string", "enum": ["account", "campaign", "adset", "ad"]},
+                "n_days": {"type": ["integer", "null"], "minimum": 1, "maximum": 365},
+                "period_a_since": {"type": ["string", "null"]},
+                "period_a_until": {"type": ["string", "null"]},
+                "period_b_since": {"type": ["string", "null"]},
+                "period_b_until": {"type": ["string", "null"]},
+                "period_a_label": {"type": ["string", "null"]},
+                "period_b_label": {"type": ["string", "null"]},
+                "search": {"type": ["string", "null"]},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                "sort_by": {"type": "string", "enum": sorted(V91_BASE_SORT_METRICS)},
+                "action_type": {"type": ["string", "null"]},
+            },
+            "required": ["mode", "level"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "listar_estrutura_meta",
+        "description": (
+            "Lê da própria Meta o setup técnico: campaign objective, optimization_goal, "
+            "optimization_sub_event, billing_event, promoted_object, destination_type e campos disponíveis. "
+            "Use para entender para que a campanha/conjunto foi configurado antes de julgá-lo."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "level": {"type": "string", "enum": ["campaign", "adset", "ad"]},
+                "search": {"type": ["string", "null"]},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            },
+            "required": ["level"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "validar_resultado_meta",
+        "description": (
+            "Depois de interpretar o setup e escolher um action_type como resultado pertinente, valida "
+            "contra os Insights da Meta se esse evento realmente existe para a entidade e retorna valor/custo."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "since": {"type": "string"},
+                "until": {"type": "string"},
+                "level": {"type": "string", "enum": ["campaign", "adset", "ad"]},
+                "entity_id": {"type": "string"},
+                "action_type": {"type": "string"},
+            },
+            "required": ["since", "until", "level", "entity_id", "action_type"],
+            "additionalProperties": False,
+        },
+    },
+]
+
+
+DYNAMIC_ANALYSIS_TOOLS.extend(ACTION_AI_TOOLS)
+
+
+def build_dynamic_instructions(context):
+    today = get_today_for_context(context)
+    return f"""
+Você é um GESTOR DE TRÁFEGO IA operando Meta Ads por WhatsApp dentro de um SaaS multiempresa.
+Você conversa com pessoas leigas. Elas não devem precisar abrir o Gerenciador de Anúncios nem conhecer termos técnicos para tomar decisões.
+
+Empresa: {context.get('company_name')}.
+Conta Meta: {context.get('ad_account_id') or 'nenhuma'}.
+Data atual na timezone da conta: {today.isoformat()}.
+
+MISSÃO
+1. Entender o que o cliente quer, seja texto ou uma transcrição de áudio.
+2. Ler o setup REAL retornado pela Meta antes de avaliar performance.
+3. Analisar de verdade: conclusão -> evidência -> interpretação -> ação.
+4. Quando houver uma ação segura que o sistema consegue executar, traduzir a intenção leiga em operação Meta.
+5. Nunca inventar números, IDs, resultados, público, orçamento, evento ou configuração.
+
+REGRA CENTRAL DA V9.1 PRESERVADA
+- A Meta é a fonte da verdade sobre objetivo/setup.
+- Não existe tabela fixa objetivo -> KPI.
+- Não deduza objetivo pelo nome da campanha.
+- Não trate Resultados como sinônimo de lead.
+- Leia campaign objective e depois optimization_goal/optimization_sub_event/billing_event/promoted_object/destination_type do conjunto.
+- Use objective_results/cost_per_objective_result/cost_per_result quando disponíveis; caso contrário confronte setup com actions/cost_per_action_type.
+- Se escolher um action_type como resultado principal, valide com validar_resultado_meta.
+- Em conta com setups mistos, não invente um KPI universal.
+
+PROTOCOLO ANALÍTICO
+- Comece pela conclusão, não por uma planilha narrada.
+- Use 2 a 4 números como evidência.
+- Explique o que eles significam e qual decisão eles sustentam.
+- Separe fato, leitura e hipótese.
+- Quando necessário, aprofunde conta -> campanha -> conjunto -> anúncio.
+- Se o cliente perguntar "o que você faria?", entregue uma recomendação executável e priorizada.
+
+V10 ACTION AI — PRINCÍPIO DE SEGURANÇA
+- IA interpreta e propõe; backend valida propriedade, permissão e payload; Meta executa.
+- Nunca faça POST livre para a Meta fora das ferramentas controladas.
+- Toda alteração em uma estrutura EXISTENTE exige confirmação antes da execução.
+- Sempre que a recomendação for uma ação que a ferramenta consegue realizar, você PODE usar propor_acao_meta para deixar o plano pendente. Isso NÃO executa nada. Depois explique em linguagem simples e peça confirmação.
+- Se o cliente responder "faça", "pode fazer", "pode ativar", "confirmo" etc., use confirmar_acao_pendente. O backend ainda verifica a mensagem real antes de executar.
+- Se houver mais de uma ação pendente e a referência estiver ambígua, liste as ações e pergunte qual delas.
+- Nunca trate um "sim" fora de contexto como autorização para gasto ou alteração.
+
+CRIAÇÃO DE CAMPANHA
+- Se o cliente pedir explicitamente para CRIAR/MONTAR uma campanha, obtenha apenas o que for necessário e use criar_estrutura_pausada.
+- Toda campaign, adset e ad criados pela ferramenta devem nascer PAUSED.
+- Não force valores críticos que o cliente não informou e que não podem ser inferidos com segurança. Pergunte em linguagem simples.
+- Se houver uma campanha existente claramente indicada como referência, você pode ler seu setup e propor reutilização/duplicação; não copie silenciosamente algo que o cliente não autorizou.
+- Depois de criar a estrutura pausada, mostre uma confirmação curta com três blocos:
+
+🎯 CAMPANHA
+Objetivo/direcionamento principal.
+
+👥 CONJUNTO DE ANÚNCIOS
+Orçamento, público/segmentação, período e otimização/destino principais.
+
+🎨 ANÚNCIOS
+Quantidade, nome dos anúncios/criativos e destino/texto quando disponíveis.
+
+Depois destaque exatamente a ideia:
+⚠️ CAMPANHA PAUSADA
+Sua campanha está criada, porém pausada.
+É preciso que você confirme para que eu possa colocá-la em veiculação.
+
+- Não ative a estrutura no mesmo turno da criação. A ativação fica como ação pendente separada.
+
+AÇÕES EM ESTRUTURAS EXISTENTES
+Use propor_acao_meta para:
+- pausar/reativar campanha, conjunto ou anúncio (set_status);
+- alterar orçamento de campanha/conjunto (set_budget);
+- duplicar campanha/conjunto/anúncio, sempre com cópia PAUSED (duplicate);
+- alterar targeting, posicionamentos, otimização, evento/destino e outros campos permitidos do conjunto (update_adset);
+- criar Pixel (create_pixel).
+
+PIXEL
+- listar_pixels consulta Pixels da conta.
+- criar Pixel exige ação pendente + confirmação.
+- Criar o objeto Pixel na Meta NÃO instala o Pixel no site. Se o cliente pedir instalação, explique que será necessária uma integração com site/GTM/CAPI/WordPress ou equivalente.
+
+REVISÃO DE ANÚNCIOS
+- A ferramenta monitora anúncios criados por ela.
+- Quando o status for aprovado/ativo/preapproved, o cliente recebe mensagem de aprovação.
+- Quando for DISAPPROVED/WITH_ISSUES, recebe reprovação/problema e você pode analisar o feedback.
+- Não diga "a campanha foi aprovada" como fato técnico se o que a Meta revisou foi o anúncio. Prefira "anúncio aprovado" ou "todos os anúncios estão aptos".
+
+LINGUAGEM PARA LEIGOS
+O cliente pode falar coisas como:
+- "Minhas campanhas estão boas?"
+- "O que está errado?"
+- "O que você faria?"
+- "Então faça."
+- "Quero vender mais sem aumentar o orçamento."
+- "Arruma as campanhas ruins."
+- "Crie uma campanha para essa nova oferta."
+- "Pausa aquele anúncio."
+- "Aumenta esse orçamento para 150 por dia."
+Você deve traduzir isso para análise/ação sem exigir que ele conheça Campaign ID, AdSet ID, CTR ou nomes da API. Use IDs internamente quando necessário.
+
+PERÍODOS
+- Sem período explícito: mês atual até hoje, salvo contexto anterior.
+- "este mês x mês passado" com mês incompleto: períodos equivalentes.
+- Datas explícitas: respeite exatamente.
+- Follow-up: preserve período e entidade da conversa quando fizer sentido.
+
+FORMATO DE RESPOSTA ANALÍTICA
+🧠 DIAGNÓSTICO
+Conclusão direta.
+
+📌 EVIDÊNCIAS
+2 a 4 dados relevantes.
+
+🔎 LEITURA
+O que isso significa.
+
+🎯 PRÓXIMA AÇÃO
+Uma ação concreta. Se ela puder ser executada pelo sistema, diga isso e deixe a ação pendente quando apropriado.
+
+FORMATAÇÃO WHATSAPP
+- Resposta limpa e curta.
+- Sem #, ##, **, _, crases ou tabelas Markdown.
+- Use emojis com parcimônia.
+- Títulos em MAIÚSCULAS.
+- Parágrafos curtos.
+- O backend fará sanitização final das respostas geradas por IA.
+"""
+
+
+def execute_dynamic_tool(context, tool_name, arguments):
+    print(f"[DYNAMIC] TOOL_EXECUTE name={tool_name} args={arguments}")
+
+    if tool_name == "consultar_insights":
+        return query_meta_insights(
+            context,
+            since=arguments["since"],
+            until=arguments["until"],
+            level=arguments.get("level", "account"),
+            search=arguments.get("search"),
+            limit=arguments.get("limit", 25),
+            sort_by=arguments.get("sort_by", "spend"),
+            sort_order=arguments.get("sort_order", "desc"),
+            min_spend=arguments.get("min_spend", 0),
+            include_zero_spend=arguments.get("include_zero_spend", True),
+            action_type=arguments.get("action_type"),
+        )
+
+    if tool_name == "comparar_periodos":
+        return compare_meta_periods(
+            context,
+            mode=arguments["mode"],
+            level=arguments.get("level", "account"),
+            n_days=arguments.get("n_days"),
+            period_a_since=arguments.get("period_a_since"),
+            period_a_until=arguments.get("period_a_until"),
+            period_b_since=arguments.get("period_b_since"),
+            period_b_until=arguments.get("period_b_until"),
+            period_a_label=arguments.get("period_a_label"),
+            period_b_label=arguments.get("period_b_label"),
+            search=arguments.get("search"),
+            limit=arguments.get("limit", 25),
+            sort_by=arguments.get("sort_by", "spend"),
+            action_type=arguments.get("action_type"),
+        )
+
+    if tool_name == "listar_estrutura_meta":
+        return list_meta_structure(
+            context,
+            level=arguments["level"],
+            search=arguments.get("search"),
+            limit=arguments.get("limit", 50),
+        )
+
+    if tool_name == "validar_resultado_meta":
+        return validate_meta_result(
+            context,
+            since=arguments["since"],
+            until=arguments["until"],
+            level=arguments["level"],
+            entity_id=arguments["entity_id"],
+            action_type=arguments["action_type"],
+        )
+
+    if tool_name == "propor_acao_meta":
+        return create_pending_action(
+            context,
+            action_type=arguments["action_type"],
+            target_type=arguments.get("target_type"),
+            target_id=arguments.get("target_id"),
+            spec=arguments.get("spec") or {},
+            summary=arguments.get("summary"),
+        )
+
+    if tool_name == "confirmar_acao_pendente":
+        return confirm_pending_action(context, arguments.get("action_id"))
+
+    if tool_name == "cancelar_acao_pendente":
+        return cancel_pending_action(context, arguments.get("action_id"))
+
+    if tool_name == "listar_acoes_pendentes":
+        return list_pending_actions(context)
+
+    if tool_name == "criar_estrutura_pausada":
+        return create_paused_structure(
+            context,
+            campaign=arguments.get("campaign") or {},
+            adset=arguments.get("adset"),
+            ads=arguments.get("ads") or [],
+        )
+
+    if tool_name == "listar_pixels":
+        return list_pixels(context)
+
+    if tool_name == "consultar_revisao_anuncios":
+        return consult_review_status(context, arguments.get("search"))
+
+    raise ValueError(f"Tool desconhecida: {tool_name}")
+
+
+@app.route("/v91-capabilities", methods=["GET"])
+def v91_capabilities():
+    return {
+        "build_id": BUILD_ID,
+        "engine": ANALYSIS_ENGINE,
+        "objective_mapping_hardcoded": OBJECTIVE_MAPPING_HARDCODED,
+        "meta_setup_fields": [
+            "campaign.objective",
+            "adset.optimization_goal",
+            "adset.optimization_sub_event",
+            "adset.billing_event",
+            "adset.promoted_object",
+            "adset.destination_type",
+        ],
+        "meta_result_fields_attempted": [
+            "objective_results",
+            "cost_per_objective_result",
+            "cost_per_result",
+            "objective_result_rate",
+            "actions",
+            "cost_per_action_type",
+            "action_values",
+        ],
+        "validation_rule": "AI interprets setup; backend validates selected action_type against Meta Insights.",
+    }, 200
+
+@app.route("/v10-capabilities", methods=["GET"])
+def v10_capabilities():
+    return {
+        "build_id": BUILD_ID,
+        "engine": ANALYSIS_ENGINE,
+        "action_ai_enabled": ACTION_AI_ENABLED,
+        "audio_input": True,
+        "transcribe_model": OPENAI_TRANSCRIBE_MODEL,
+        "review_watcher_enabled": REVIEW_WATCH_ENABLED,
+        "writes_require_confirmation": True,
+        "new_structures_forced_paused": True,
+        "supported_actions": [
+            "pause_activate_campaign_adset_ad",
+            "change_budget_campaign_adset",
+            "update_adset_targeting_optimization",
+            "duplicate_campaign_adset_ad_paused",
+            "create_campaign_adset_ad_paused",
+            "list_pixels",
+            "create_pixel_with_confirmation",
+            "review_status_notifications",
+            "whatsapp_audio_transcription",
+        ],
+    }, 200
 
 
 # =========================================================
