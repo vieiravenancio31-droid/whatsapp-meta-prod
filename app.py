@@ -30,7 +30,7 @@ from psycopg.rows import dict_row
 
 app = Flask(__name__)
 
-BUILD_ID = "v10-action-ai-2026-09-04"
+BUILD_ID = "v10.1-action-ai-audio-clean-2026-09-04"
 ANALYSIS_ENGINE = "meta_driven_v9_1_action_ai_v10"
 OBJECTIVE_MAPPING_HARDCODED = False
 print("BOOT BUILD_ID:", BUILD_ID)
@@ -1869,10 +1869,6 @@ def transcribe_whatsapp_audio(media_id):
 def process_audio_message(sender, user_id, media_id):
     try:
         transcript = transcribe_whatsapp_audio(media_id)
-        send_whatsapp_message(
-            sender,
-            "🎙️ ÁUDIO ENTENDIDO\n\n" + transcript,
-        )
         process_dynamic_analysis(sender, user_id, transcript)
     except Exception as error:
         print("[V10] AUDIO_PROCESS_ERROR", repr(error))
@@ -2966,7 +2962,7 @@ def process_dynamic_analysis(sender, user_id, original_text):
         if not OPENAI_API_KEY:
             raise RuntimeError("OPENAI_API_KEY não configurada.")
 
-        send_whatsapp_message(sender, "🔎 Analisando sua pergunta no Meta Ads...")
+        send_whatsapp_message(sender, "🔎 Analisando sua solicitação no Meta Ads...")
 
         log_activity(
             context,
@@ -3170,7 +3166,6 @@ def receive_webhook():
                 send_whatsapp_message(sender, "⏳ Já estou processando outra solicitação sua. Tente novamente em instantes.")
                 return "EVENT_RECEIVED", 200
 
-            send_whatsapp_message(sender, "🎙️ Áudio recebido. Vou ouvir e executar a mesma lógica de uma mensagem de texto.")
             try:
                 audio_thread = threading.Thread(
                     target=process_audio_message,
