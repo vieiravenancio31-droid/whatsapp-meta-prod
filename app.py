@@ -18,6 +18,7 @@ from urllib.parse import urlencode
 
 import psycopg
 import requests
+from requests.adapters import HTTPAdapter
 from cryptography.fernet import Fernet, InvalidToken
 from flask import Flask, request
 from openai import OpenAI
@@ -30,8 +31,8 @@ from psycopg.rows import dict_row
 
 app = Flask(__name__)
 
-BUILD_ID = "v10.1-action-ai-audio-clean-2026-09-04"
-ANALYSIS_ENGINE = "meta_driven_v9_1_action_ai_v10"
+BUILD_ID = "v10.2-hybrid-wizard-media-progress-2026-09-04"
+ANALYSIS_ENGINE = "meta_driven_v9_1_action_ai_v10_2"
 OBJECTIVE_MAPPING_HARDCODED = False
 print("BOOT BUILD_ID:", BUILD_ID)
 print("BOOT ANALYSIS_ENGINE:", ANALYSIS_ENGINE)
@@ -97,6 +98,17 @@ WHATSAPP_REVIEW_APPROVED_TEMPLATE = os.getenv("WHATSAPP_REVIEW_APPROVED_TEMPLATE
 WHATSAPP_REVIEW_REJECTED_TEMPLATE = os.getenv("WHATSAPP_REVIEW_REJECTED_TEMPLATE")
 WHATSAPP_TEMPLATE_LANGUAGE = os.getenv("WHATSAPP_TEMPLATE_LANGUAGE", "pt_BR")
 
+# V10.2 — Campaign Wizard / mídia / progresso
+CAMPAIGN_WIZARD_ENABLED = os.getenv("CAMPAIGN_WIZARD_ENABLED", "true").strip().lower() in {"1", "true", "yes", "sim"}
+try:
+    PROGRESS_UPDATE_SECONDS = max(20, int(os.getenv("PROGRESS_UPDATE_SECONDS", "50")))
+except ValueError:
+    PROGRESS_UPDATE_SECONDS = 50
+try:
+    WIZARD_MAX_MEDIA_BYTES = max(1_000_000, int(os.getenv("WIZARD_MAX_MEDIA_BYTES", str(25 * 1024 * 1024))))
+except ValueError:
+    WIZARD_MAX_MEDIA_BYTES = 25 * 1024 * 1024
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_WHATSAPP_NUMBER = os.getenv("ADMIN_WHATSAPP_NUMBER")
 
@@ -105,10 +117,14 @@ DEFAULT_COMPANY_NAME = os.getenv("DEFAULT_COMPANY_NAME", "Empresa Principal")
 
 
 # =========================================================
-# OPENAI
+# OPENAI / HTTP
 # =========================================================
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Reaproveita conexões HTTP para reduzir latência/overhead sem adicionar dependências.
+http_session = requests.Session()
+http_session.mount("https://", HTTPAdapter(pool_connections=20, pool_maxsize=50, max_retries=0))
 
 
 # =========================================================
@@ -443,6 +459,48 @@ def initialize_database():
                         body TEXT NOT NULL,
                         delivered_at TIMESTAMPTZ,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                    """
+                )
+
+                # V10.2 — estado persistente do Campaign Creation Wizard.
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS campaign_wizards (
+                        id BIGSERIAL PRIMARY KEY,
+                        company_id BIGINT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+                        user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        ad_account_id TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'DRAFT',
+                        draft JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        created_ids JSONB,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        completed_at TIMESTAMPTZ
+                    );
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_campaign_wizards_user_status
+                    ON campaign_wizards(user_id, status, updated_at DESC);
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS campaign_wizard_assets (
+                        id BIGSERIAL PRIMARY KEY,
+                        wizard_id BIGINT NOT NULL REFERENCES campaign_wizards(id) ON DELETE CASCADE,
+                        company_id BIGINT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+                        whatsapp_media_id TEXT,
+                        media_type TEXT NOT NULL,
+                        mime_type TEXT,
+                        original_name TEXT,
+                        caption TEXT,
+                        meta_image_hash TEXT,
+                        meta_video_id TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        UNIQUE(company_id, whatsapp_media_id)
                     );
                     """
                 )
@@ -1199,6 +1257,9 @@ def home():
         "analysis_reasoning_effort": OPENAI_ANALYSIS_REASONING_EFFORT,
         "action_ai": "enabled" if ACTION_AI_ENABLED else "disabled",
         "audio_input": "enabled",
+        "image_video_input": "enabled",
+        "campaign_wizard": "enabled" if CAMPAIGN_WIZARD_ENABLED else "disabled",
+        "progress_update_seconds": PROGRESS_UPDATE_SECONDS,
         "review_watcher": "enabled" if REVIEW_WATCH_ENABLED else "disabled",
         "transcribe_model": OPENAI_TRANSCRIBE_MODEL,
     }, 200
@@ -1458,7 +1519,7 @@ def send_whatsapp_message(to, text):
         },
     }
 
-    response = requests.post(
+    response = http_session.post(
         url,
         headers=headers,
         json=payload,
@@ -1503,6 +1564,11 @@ def clean_ai_text_for_whatsapp(text):
         "comparativo": "📊",
         "metricas": "📈",
         "principais metricas": "📈",
+        "evidencias": "📌",
+        "evidencia": "📌",
+        "o que isso significa": "🔎",
+        "leitura": "🔎",
+        "o que eu faria agora": "🎯",
         "pontos positivos": "✅",
         "ponto positivo": "✅",
         "melhor sinal": "✅",
@@ -1524,8 +1590,11 @@ def clean_ai_text_for_whatsapp(text):
         "prioridade": "🎯",
         "prioridades": "🎯",
         "campanhas": "📣",
-        "anuncios": "🧩",
-        "conjuntos": "🧩",
+        "campanha": "🎯",
+        "anuncios": "🎨",
+        "anuncio": "🎨",
+        "conjunto de anuncios": "👥",
+        "conjuntos": "👥",
         "conjuntos de anuncios": "🧩",
         "conclusao": "🧠",
         "diagnostico": "🧠",
@@ -1636,7 +1705,69 @@ def clean_ai_text_for_whatsapp(text):
     result = result.replace("```", "")
     result = re.sub(r"\n{3,}", "\n\n", result)
 
-    return result.strip()
+    return improve_whatsapp_readability(result.strip())
+
+
+def improve_whatsapp_readability(text, max_paragraph_chars=420):
+    """Mantém respostas fáceis de escanear no WhatsApp sem depender de Markdown."""
+    text = str(text or "").strip()
+    if not text:
+        return ""
+
+    def looks_like_heading(line):
+        core = re.sub(r"^[\U0001F300-\U0001FAFF\u2600-\u27BF\uFE0F]+\s*", "", line).strip().rstrip(":")
+        return (
+            1 <= len(core) <= 70
+            and any(ch.isalpha() for ch in core)
+            and core.upper() == core
+            and len(core.split()) <= 9
+        )
+
+    def append_wrapped(line, output):
+        line = line.strip()
+        if not line:
+            return
+        if len(line) <= max_paragraph_chars or line.startswith("• "):
+            output.append(line)
+            return
+        sentences = re.split(r"(?<=[.!?])\s+", line)
+        current = []
+        current_len = 0
+        for sentence in sentences:
+            projected = current_len + (1 if current else 0) + len(sentence)
+            if current and projected > max_paragraph_chars:
+                output.append(" ".join(current).strip())
+                current = [sentence]
+                current_len = len(sentence)
+            else:
+                current.append(sentence)
+                current_len = projected
+        if current:
+            output.append(" ".join(current).strip())
+
+    paragraphs = []
+    for block in re.split(r"\n\s*\n", text):
+        block_lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
+        if not block_lines:
+            continue
+
+        # Se o bloco começou por um título, deixa o título isolado para criar respiro visual.
+        if looks_like_heading(block_lines[0]):
+            paragraphs.append(block_lines[0])
+            block_lines = block_lines[1:]
+
+        if not block_lines:
+            continue
+
+        if all(line.startswith("• ") for line in block_lines):
+            paragraphs.append("\n".join(block_lines))
+            continue
+
+        for line in block_lines:
+            append_wrapped(line, paragraphs)
+
+    return "\n\n".join(paragraphs).strip()
+
 
 def send_whatsapp_long_message(to, text, max_chars=3500):
     text = clean_ai_text_for_whatsapp(text)
@@ -1662,6 +1793,101 @@ def send_whatsapp_long_message(to, text, max_chars=3500):
         responses.append(send_whatsapp_message(to, chunk))
     return responses
 
+
+
+# =========================================================
+# V10.2 — PROGRESSO / ERROS AMIGÁVEIS
+# =========================================================
+
+class WhatsAppProgressHeartbeat:
+    def __init__(self, sender, interval_seconds=None):
+        self.sender = sender
+        self.interval_seconds = int(interval_seconds or PROGRESS_UPDATE_SECONDS)
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.started_at = None
+
+    def start(self):
+        self.started_at = time.monotonic()
+        send_whatsapp_message(self.sender, "🔎 Analisando sua solicitação no Meta Ads...")
+        self.thread = threading.Thread(
+            target=self._loop,
+            daemon=True,
+            name=f"progress-{self.sender}",
+        )
+        self.thread.start()
+        return self
+
+    def _loop(self):
+        count = 0
+        while not self.stop_event.wait(self.interval_seconds):
+            count += 1
+            elapsed = count * self.interval_seconds
+            if count == 1:
+                body = (
+                    f"⏳ Ainda estou analisando sua solicitação. Já se passaram {elapsed} segundos. "
+                    "Estou cruzando os dados no Meta Ads para te responder com segurança."
+                )
+            elif count == 2:
+                body = (
+                    f"🔎 A análise continua em andamento. Já se passaram {elapsed} segundos. "
+                    "Estou aprofundando a verificação — aguarde mais um pouco."
+                )
+            else:
+                body = (
+                    f"⏳ Continuo trabalhando na sua solicitação. Já se passaram {elapsed} segundos. "
+                    "O processamento segue normalmente e eu te aviso assim que concluir."
+                )
+            try:
+                send_whatsapp_message(self.sender, body)
+            except Exception as error:
+                print("[V10.2] PROGRESS_MESSAGE_ERROR", repr(error))
+
+    def stop(self):
+        self.stop_event.set()
+
+
+def start_request_progress(sender):
+    return WhatsAppProgressHeartbeat(sender).start()
+
+
+def build_user_friendly_error(error, stage="solicitação"):
+    raw = str(error or "")
+    normalized = normalize_text(raw)
+
+    if "expirada" in normalized or "expired" in normalized or "oauth" in normalized or "access token" in normalized:
+        return (
+            "🔐 PRECISO RECONECTAR A META\n\n"
+            "Não consegui concluir porque a autorização da sua conta Meta precisa ser renovada.\n\n"
+            "Envie: conectar meta\n\n"
+            "Depois disso, você pode repetir a solicitação."
+        )
+    if "permission" in normalized or "permiss" in normalized or "acesso negado" in normalized:
+        return (
+            "⛔ NÃO CONSEGUI CONCLUIR\n\n"
+            "A Meta não autorizou uma das etapas necessárias para essa ação. "
+            "Sua estrutura atual não foi alterada.\n\n"
+            "Vou precisar que a permissão da conta seja revisada antes de tentar novamente."
+        )
+    if "timeout" in normalized or "timed out" in normalized or "tempo" in normalized:
+        return (
+            "⏱️ A CONSULTA DEMOROU MAIS QUE O ESPERADO\n\n"
+            "Não finalizei a operação para evitar uma resposta incompleta ou uma alteração pela metade.\n\n"
+            "Sua conta permanece segura. Você pode repetir a solicitação em alguns instantes."
+        )
+    if "transcri" in normalized or "audio" in normalized:
+        return (
+            "🎙️ NÃO CONSEGUI INTERPRETAR O ÁUDIO\n\n"
+            "O arquivo chegou, mas eu não consegui transformar a mensagem em uma solicitação confiável.\n\n"
+            "Tente enviar o áudio novamente ou escreva a solicitação em texto."
+        )
+    return (
+        "❌ NÃO CONSEGUI CONCLUIR ESSA SOLICITAÇÃO\n\n"
+        f"Tive um problema durante o processamento da {stage}. "
+        "Para sua segurança, não vou assumir que alguma alteração foi concluída.\n\n"
+        "Se a solicitação envolvia mudança na Meta, confira: nenhuma nova ação será ativada automaticamente. "
+        "Você pode tentar novamente e eu retomo a partir do ponto seguro."
+    )
 
 
 # =========================================================
@@ -1733,7 +1959,7 @@ def send_whatsapp_template(to, template_name, language_code=None):
             "language": {"code": language_code or WHATSAPP_TEMPLATE_LANGUAGE},
         },
     }
-    response = requests.post(url, headers=headers, json=payload, timeout=30)
+    response = http_session.post(url, headers=headers, json=payload, timeout=30)
     print("[V10] WHATSAPP_TEMPLATE:", response.status_code, response.text)
     return response
 
@@ -1812,7 +2038,7 @@ def retrieve_whatsapp_media(media_id):
     if not media_url:
         raise RuntimeError("WhatsApp não retornou URL da mídia.")
 
-    download_response = requests.get(media_url, headers=headers, timeout=60)
+    download_response = http_session.get(media_url, headers=headers, timeout=60)
     if download_response.status_code != 200:
         raise RuntimeError(
             f"Não foi possível baixar o áudio: "
@@ -1866,17 +2092,16 @@ def transcribe_whatsapp_audio(media_id):
     return text
 
 
-def process_audio_message(sender, user_id, media_id):
+def process_audio_message(sender, user_id, media_id, progress=None):
+    progress = progress or start_request_progress(sender)
     try:
         transcript = transcribe_whatsapp_audio(media_id)
-        process_dynamic_analysis(sender, user_id, transcript)
+        process_dynamic_analysis(sender, user_id, transcript, progress=progress)
     except Exception as error:
-        print("[V10] AUDIO_PROCESS_ERROR", repr(error))
+        print("[V10.2] AUDIO_PROCESS_ERROR", repr(error))
         traceback.print_exc()
-        send_whatsapp_message(
-            sender,
-            "❌ Não consegui entender esse áudio. Tente enviar novamente ou escreva a mensagem em texto.",
-        )
+        progress.stop()
+        send_whatsapp_message(sender, build_user_friendly_error(error, stage="transcrição do áudio"))
         release_analysis_lock(user_id)
 
 # =========================================================
@@ -2925,11 +3150,13 @@ def release_analysis_lock(user_id):
         active_analysis_users.discard(user_id)
 
 
-def process_dynamic_analysis(sender, user_id, original_text):
+def process_dynamic_analysis(sender, user_id, original_text, progress=None):
     print(
         "[DYNAMIC] JOB_START",
         {"sender": sender, "user_id": user_id, "question": original_text},
     )
+
+    progress = progress or start_request_progress(sender)
 
     try:
         context = get_user_context(sender)
@@ -2943,26 +3170,26 @@ def process_dynamic_analysis(sender, user_id, original_text):
         )
 
         if not context:
-            send_whatsapp_message(
-                sender,
-                "⛔ Este número ainda não está cadastrado no sistema.",
-            )
+            send_whatsapp_message(sender, "⛔ Este número ainda não está cadastrado no sistema.")
             return
 
         context = dict(context)
         context["_current_user_text"] = original_text
 
         if not context.get("can_read_ads"):
-            send_whatsapp_message(
-                sender,
-                "⛔ Você não possui permissão para consultar Meta Ads.",
-            )
+            send_whatsapp_message(sender, "⛔ Você não possui permissão para consultar Meta Ads.")
             return
 
         if not OPENAI_API_KEY:
             raise RuntimeError("OPENAI_API_KEY não configurada.")
 
-        send_whatsapp_message(sender, "🔎 Analisando sua solicitação no Meta Ads...")
+        # Injeta no prompt o estado persistente do wizard, quando existir.
+        if CAMPAIGN_WIZARD_ENABLED:
+            try:
+                context["_campaign_wizard"] = get_active_campaign_wizard(context)
+            except Exception as wizard_error:
+                print("[V10.2] WIZARD_CONTEXT_ERROR", repr(wizard_error))
+                context["_campaign_wizard"] = None
 
         log_activity(
             context,
@@ -2996,6 +3223,7 @@ def process_dynamic_analysis(sender, user_id, original_text):
                 "chars": len(formatted_answer),
             },
         )
+        progress.stop()
         send_whatsapp_long_message(sender, formatted_answer)
         print("[DYNAMIC] JOB_DONE")
 
@@ -3017,15 +3245,10 @@ def process_dynamic_analysis(sender, user_id, original_text):
         except Exception:
             traceback.print_exc()
 
-        send_whatsapp_message(
-            sender,
-            (
-                "❌ Ocorreu um erro ao processar a análise. "
-                "A mensagem chegou ao motor dinâmico; verifique os logs do Railway "
-                f"procurando por *{BUILD_ID}* e *[DYNAMIC] JOB_ERROR*."
-            ),
-        )
+        progress.stop()
+        send_whatsapp_message(sender, build_user_friendly_error(error, stage="análise no Meta Ads"))
     finally:
+        progress.stop()
         release_analysis_lock(user_id)
         print("[DYNAMIC] JOB_RELEASED", {"user_id": user_id})
 
@@ -3166,21 +3389,48 @@ def receive_webhook():
                 send_whatsapp_message(sender, "⏳ Já estou processando outra solicitação sua. Tente novamente em instantes.")
                 return "EVENT_RECEIVED", 200
 
+            progress = start_request_progress(sender)
             try:
                 audio_thread = threading.Thread(
                     target=process_audio_message,
-                    args=(sender, context["user_id"], media_id),
+                    args=(sender, context["user_id"], media_id, progress),
                     daemon=True,
                     name=f"audio-analysis-{context['user_id']}",
                 )
                 audio_thread.start()
             except Exception:
+                progress.stop()
+                release_analysis_lock(context["user_id"])
+                raise
+            return "EVENT_RECEIVED", 200
+
+        if message_type in {"image", "video"}:
+            media_payload = message.get(message_type) or {}
+            media_id = media_payload.get("id")
+            caption = (media_payload.get("caption") or "").strip()
+            if not media_id:
+                send_whatsapp_message(sender, "❌ Recebi o arquivo, mas não encontrei a mídia para processar.")
+                return "EVENT_RECEIVED", 200
+            if not acquire_analysis_lock(context["user_id"]):
+                send_whatsapp_message(sender, "⏳ Já estou processando outra solicitação sua. Aguarde um instante.")
+                return "EVENT_RECEIVED", 200
+            progress = start_request_progress(sender)
+            try:
+                media_thread = threading.Thread(
+                    target=process_wizard_media_message,
+                    args=(sender, context["user_id"], media_id, message_type, caption, progress),
+                    daemon=True,
+                    name=f"wizard-media-{context['user_id']}",
+                )
+                media_thread.start()
+            except Exception:
+                progress.stop()
                 release_analysis_lock(context["user_id"])
                 raise
             return "EVENT_RECEIVED", 200
 
         if message_type != "text":
-            send_whatsapp_message(sender, "ℹ️ Neste momento eu entendo mensagens de texto e áudio.")
+            send_whatsapp_message(sender, "ℹ️ Neste momento eu entendo texto, áudio, imagem e vídeo.")
             return "EVENT_RECEIVED", 200
 
         original_text = (message.get("text") or {}).get("body", "").strip()
@@ -3568,7 +3818,9 @@ def receive_webhook():
                 "• Identifique na Meta o objetivo desta campanha e analise o resultado correto\n"
                 "• Quais campanhas realmente merecem atenção considerando o próprio setup?\n"
                 "• Compare os últimos 15 dias com os 15 anteriores\n"
-                "• Agora aprofunde na campanha que você acabou de citar\n\n"
+                "• Agora aprofunde na campanha que você acabou de citar\n"
+                "• Quero criar uma campanha nova\n"
+                "• Durante a criação, envie imagem ou vídeo direto aqui no WhatsApp\n\n"
                 "Comandos administrativos/técnicos:\n\n"
                 "🔗 conectar meta\n"
                 "📂 minhas contas meta\n"
@@ -3602,10 +3854,11 @@ def receive_webhook():
             )
             return "EVENT_RECEIVED", 200
 
+        progress = start_request_progress(sender)
         try:
             analysis_thread = threading.Thread(
                 target=process_dynamic_analysis,
-                args=(sender, context["user_id"], original_text),
+                args=(sender, context["user_id"], original_text, progress),
                 daemon=True,
                 name=f"dynamic-analysis-{context['user_id']}",
             )
@@ -3619,6 +3872,7 @@ def receive_webhook():
                 },
             )
         except Exception:
+            progress.stop()
             release_analysis_lock(context["user_id"])
             raise
 
@@ -4638,7 +4892,7 @@ def meta_graph_get(context, path, fields=None, params=None, timeout=30):
     proof = appsecret_proof(access_token)
     if proof:
         query["appsecret_proof"] = proof
-    response = requests.get(
+    response = http_session.get(
         f"https://graph.facebook.com/{GRAPH_API_VERSION}/{path}",
         params=query,
         headers={"Authorization": f"Bearer {access_token}"},
@@ -4657,7 +4911,7 @@ def meta_graph_post(context, path, data=None, timeout=45):
     proof = appsecret_proof(access_token)
     if proof:
         payload["appsecret_proof"] = proof
-    response = requests.post(
+    response = http_session.post(
         f"https://graph.facebook.com/{GRAPH_API_VERSION}/{path}",
         data=payload,
         headers={"Authorization": f"Bearer {access_token}"},
@@ -5396,6 +5650,557 @@ def consult_review_status(context, search=None):
             return cursor.fetchall()
 
 
+# =========================================================
+# V10.2 — HYBRID CAMPAIGN CREATION WIZARD + MÍDIA
+# =========================================================
+
+WIZARD_ACTIVE_STATUSES = {"DRAFT", "WAITING_CREATION_CONFIRMATION"}
+WIZARD_CAMPAIGN_ALLOWED_FIELDS = {
+    "name", "objective", "buying_type", "special_ad_categories",
+    "bid_strategy", "is_adset_budget_sharing_enabled",
+}
+WIZARD_ADSET_ALLOWED_FIELDS = {
+    "name", "daily_budget", "lifetime_budget", "billing_event", "optimization_goal",
+    "optimization_sub_event", "bid_strategy", "bid_amount", "targeting", "promoted_object",
+    "destination_type", "start_time", "end_time", "attribution_spec",
+}
+
+
+def deep_merge_dict(base, updates):
+    result = dict(base or {})
+    for key, value in (updates or {}).items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge_dict(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def get_active_campaign_wizard(context):
+    initialize_database()
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, company_id, user_id, ad_account_id, status, draft,
+                       created_ids, created_at, updated_at
+                FROM campaign_wizards
+                WHERE company_id=%s AND user_id=%s AND ad_account_id=%s
+                  AND status IN ('DRAFT','WAITING_CREATION_CONFIRMATION')
+                ORDER BY updated_at DESC
+                LIMIT 1;
+                """,
+                (context["company_id"], context["user_id"], context["ad_account_id"]),
+            )
+            row = cursor.fetchone()
+    if not row:
+        return None
+    row = dict(row)
+    row["draft"] = dict(row.get("draft") or {})
+    row["assets"] = list_campaign_wizard_assets(row["id"])
+    row["missing"] = campaign_wizard_missing(row["draft"], row["assets"])
+    return row
+
+
+def start_campaign_wizard(context, initial=None):
+    if not CAMPAIGN_WIZARD_ENABLED:
+        raise RuntimeError("Campaign Wizard está desativado.")
+    if not context.get("can_create_campaigns"):
+        raise PermissionError("Usuário sem permissão para criar campanhas.")
+    if not context.get("ad_account_id"):
+        raise RuntimeError("Selecione uma conta Meta antes de iniciar a campanha.")
+
+    existing = get_active_campaign_wizard(context)
+    if existing:
+        return existing
+
+    draft = dict(initial or {})
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO campaign_wizards (company_id, user_id, ad_account_id, status, draft)
+                VALUES (%s,%s,%s,'DRAFT',%s::jsonb)
+                RETURNING id;
+                """,
+                (
+                    context["company_id"], context["user_id"], context["ad_account_id"],
+                    json.dumps(draft, ensure_ascii=False, default=str),
+                ),
+            )
+            wizard_id = cursor.fetchone()["id"]
+    log_activity(context, "campaign_wizard_started", {"wizard_id": wizard_id})
+    return get_active_campaign_wizard(context)
+
+
+def update_campaign_wizard(context, updates):
+    wizard = get_active_campaign_wizard(context)
+    if not wizard:
+        wizard = start_campaign_wizard(context)
+    if wizard["status"] != "DRAFT":
+        return {
+            "updated": False,
+            "reason": "O resumo já está aguardando confirmação. Se quiser mudar algo, peça para editar antes de criar.",
+            "wizard": wizard,
+        }
+    draft = deep_merge_dict(wizard.get("draft") or {}, updates or {})
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE campaign_wizards
+                SET draft=%s::jsonb, updated_at=NOW()
+                WHERE id=%s AND company_id=%s AND user_id=%s;
+                """,
+                (
+                    json.dumps(draft, ensure_ascii=False, default=str),
+                    wizard["id"], context["company_id"], context["user_id"],
+                ),
+            )
+    return get_active_campaign_wizard(context)
+
+
+def reopen_campaign_wizard(context):
+    wizard = get_active_campaign_wizard(context)
+    if not wizard:
+        return {"updated": False, "reason": "Nenhuma campanha em montagem."}
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "UPDATE campaign_wizards SET status='DRAFT', updated_at=NOW() WHERE id=%s;",
+                (wizard["id"],),
+            )
+    return get_active_campaign_wizard(context)
+
+
+def cancel_campaign_wizard(context):
+    wizard = get_active_campaign_wizard(context)
+    if not wizard:
+        return {"cancelled": False, "reason": "Nenhuma campanha em montagem."}
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "UPDATE campaign_wizards SET status='CANCELLED', completed_at=NOW(), updated_at=NOW() WHERE id=%s;",
+                (wizard["id"],),
+            )
+    log_activity(context, "campaign_wizard_cancelled", {"wizard_id": wizard["id"]})
+    return {"cancelled": True, "wizard_id": wizard["id"]}
+
+
+def list_campaign_wizard_assets(wizard_id):
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, media_type, mime_type, original_name, caption,
+                       meta_image_hash, meta_video_id, created_at
+                FROM campaign_wizard_assets
+                WHERE wizard_id=%s
+                ORDER BY id ASC;
+                """,
+                (wizard_id,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+
+def campaign_wizard_missing(draft, assets=None):
+    draft = dict(draft or {})
+    campaign = dict(draft.get("campaign") or {})
+    adset = dict(draft.get("adset") or {})
+    creative = dict(draft.get("creative") or {})
+    assets = assets or []
+    missing = []
+
+    if not str(campaign.get("name") or "").strip():
+        missing.append("nome da campanha")
+    if not str(campaign.get("objective") or "").strip():
+        missing.append("objetivo principal")
+    if "special_ad_categories" not in campaign:
+        missing.append("categoria especial (imóveis/habitação, crédito, emprego, política ou nenhuma)")
+    if not str(adset.get("name") or "").strip():
+        missing.append("nome do conjunto de anúncios")
+    if adset.get("daily_budget_major") is None and adset.get("lifetime_budget_major") is None:
+        missing.append("orçamento")
+    if not adset.get("targeting"):
+        missing.append("público/segmentação")
+    if not str(adset.get("optimization_goal") or "").strip():
+        missing.append("otimização do conjunto")
+    if not str(adset.get("billing_event") or "").strip():
+        missing.append("forma de cobrança")
+    existing_creatives = list(draft.get("existing_creative_ids") or [])
+    if assets and not str(creative.get("page_id") or "").strip():
+        missing.append("Página do Facebook/identidade do anúncio")
+
+    if not assets and not existing_creatives:
+        missing.append("pelo menos um criativo (imagem/vídeo ou creative_id existente)")
+
+    # Para criativos novos em formato de link, precisamos de destino e texto.
+    if assets:
+        if not str(creative.get("destination_url") or "").strip():
+            missing.append("link/destino do anúncio")
+        if not str(creative.get("primary_text") or "").strip():
+            missing.append("texto principal do anúncio")
+        if not str(creative.get("headline") or "").strip():
+            missing.append("título do anúncio")
+
+    return missing
+
+
+def list_pages_for_wizard(context):
+    data = meta_graph_get(context, "me/accounts", fields="id,name,category", params={"limit": 100})
+    return data.get("data", [])
+
+
+def search_meta_locations(context, query, location_types=None, limit=20):
+    params = {
+        "type": "adgeolocation",
+        "q": str(query or "").strip(),
+        "limit": max(1, min(int(limit or 20), 50)),
+    }
+    if location_types:
+        params["location_types"] = json.dumps(location_types, ensure_ascii=False)
+    data = meta_graph_get(context, "search", params=params)
+    return data.get("data", [])
+
+
+def search_meta_interests(context, query, limit=20):
+    data = meta_graph_get(
+        context,
+        "search",
+        params={"type": "adinterest", "q": str(query or "").strip(), "limit": max(1, min(int(limit or 20), 50))},
+    )
+    return data.get("data", [])
+
+
+def meta_graph_post_file(context, path, field_name, filename, content, mime_type, data=None, timeout=120):
+    _, access_token, error = get_meta_credentials(context)
+    if error:
+        raise RuntimeError(error)
+    payload = dict(data or {})
+    proof = appsecret_proof(access_token)
+    if proof:
+        payload["appsecret_proof"] = proof
+    response = http_session.post(
+        f"https://graph.facebook.com/{GRAPH_API_VERSION}/{path}",
+        data=payload,
+        files={field_name: (filename, content, mime_type or "application/octet-stream")},
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=timeout,
+    )
+    if response.status_code >= 300:
+        raise RuntimeError(f"Meta upload {path}: {response.status_code} {response.text}")
+    return response.json()
+
+
+def upload_wizard_media_to_meta(context, wizard, media_id, media_type, caption=None):
+    if media_type not in {"image", "video"}:
+        raise ValueError("O wizard aceita imagem ou vídeo.")
+    media = retrieve_whatsapp_media(media_id)
+    content = media["content"]
+    if len(content) > WIZARD_MAX_MEDIA_BYTES:
+        raise ValueError(
+            f"O arquivo tem {len(content) / 1024 / 1024:.1f} MB e ultrapassa o limite operacional de "
+            f"{WIZARD_MAX_MEDIA_BYTES / 1024 / 1024:.0f} MB desta versão."
+        )
+    mime = (media.get("mime_type") or "application/octet-stream").split(";")[0]
+    extension = mimetypes.guess_extension(mime) or (".jpg" if media_type == "image" else ".mp4")
+    filename = f"wizard_{wizard['id']}_{uuid.uuid4().hex[:8]}{extension}"
+
+    image_hash = None
+    video_id = None
+    if media_type == "image":
+        result = meta_graph_post_file(
+            context, f"{context['ad_account_id']}/adimages", "filename", filename, content, mime, timeout=90,
+        )
+        images = result.get("images") or {}
+        if isinstance(images, dict) and images:
+            first = next(iter(images.values()))
+            if isinstance(first, dict):
+                image_hash = first.get("hash")
+        image_hash = image_hash or result.get("hash")
+        if not image_hash:
+            raise RuntimeError("A Meta recebeu a imagem, mas não retornou o image_hash.")
+    else:
+        result = meta_graph_post_file(
+            context, f"{context['ad_account_id']}/advideos", "source", filename, content, mime,
+            data={"title": filename}, timeout=180,
+        )
+        video_id = result.get("id") or result.get("video_id")
+        if not video_id:
+            raise RuntimeError("A Meta recebeu o vídeo, mas não retornou o video_id.")
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO campaign_wizard_assets (
+                    wizard_id, company_id, whatsapp_media_id, media_type, mime_type,
+                    original_name, caption, meta_image_hash, meta_video_id
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (company_id, whatsapp_media_id)
+                DO UPDATE SET caption=EXCLUDED.caption
+                RETURNING id;
+                """,
+                (
+                    wizard["id"], context["company_id"], media_id, media_type, mime,
+                    filename, caption, image_hash, video_id,
+                ),
+            )
+            asset_id = cursor.fetchone()["id"]
+
+    # Se a pessoa usou a legenda como copy e ainda não havia texto principal, aproveita-a como rascunho.
+    if caption:
+        draft = dict(wizard.get("draft") or {})
+        creative = dict(draft.get("creative") or {})
+        if not creative.get("primary_text"):
+            update_campaign_wizard(context, {"creative": {"primary_text": caption}})
+
+    log_activity(context, "campaign_wizard_media_uploaded", {"wizard_id": wizard["id"], "asset_id": asset_id, "media_type": media_type})
+    return {
+        "asset_id": asset_id,
+        "media_type": media_type,
+        "meta_image_hash": image_hash,
+        "meta_video_id": video_id,
+    }
+
+
+def process_wizard_media_message(sender, user_id, media_id, media_type, caption=None, progress=None):
+    progress = progress or start_request_progress(sender)
+    try:
+        context = get_user_context(sender)
+        if not context:
+            raise RuntimeError("Usuário não cadastrado.")
+        context = dict(context)
+        wizard = get_active_campaign_wizard(context)
+        if not wizard:
+            progress.stop()
+            send_whatsapp_message(
+                sender,
+                "📎 RECEBI O ARQUIVO\n\nAinda não existe uma campanha em montagem. "
+                "Diga algo como: Quero criar uma campanha. Depois eu uso a imagem ou o vídeo dentro do wizard.",
+            )
+            return
+        result = upload_wizard_media_to_meta(context, wizard, media_id, media_type, caption)
+        wizard = get_active_campaign_wizard(context)
+        progress.stop()
+        send_whatsapp_message(
+            sender,
+            (
+                f"✅ {media_type.upper()} ADICIONADO À CAMPANHA\n\n"
+                f"O criativo foi preparado para uso no anúncio. Agora faltam: "
+                f"{', '.join(wizard.get('missing') or []) if wizard.get('missing') else 'nenhuma informação obrigatória'}.\n\n"
+                "Pode continuar me dizendo, por texto ou áudio, como quer montar a campanha."
+            ),
+        )
+    except Exception as error:
+        print("[V10.2] WIZARD_MEDIA_ERROR", repr(error))
+        traceback.print_exc()
+        progress.stop()
+        send_whatsapp_message(sender, build_user_friendly_error(error, stage="envio do criativo"))
+    finally:
+        progress.stop()
+        release_analysis_lock(user_id)
+
+
+def build_wizard_creative_payload(asset, creative):
+    page_id = str(creative.get("page_id") or "").strip()
+    destination_url = str(creative.get("destination_url") or "").strip()
+    primary_text = str(creative.get("primary_text") or "").strip()
+    headline = str(creative.get("headline") or "").strip()
+    description = str(creative.get("description") or "").strip()
+    cta_type = str(creative.get("call_to_action_type") or "LEARN_MORE").upper()
+
+    if not page_id or not destination_url:
+        raise ValueError("Para criativo novo, page_id e destination_url são obrigatórios.")
+
+    cta = {"type": cta_type, "value": {"link": destination_url}}
+    if asset.get("media_type") == "image":
+        link_data = {
+            "link": destination_url,
+            "message": primary_text,
+            "name": headline,
+            "call_to_action": cta,
+            "image_hash": asset.get("meta_image_hash"),
+        }
+        if description:
+            link_data["description"] = description
+        return {"object_story_spec": {"page_id": page_id, "link_data": link_data}}
+
+    if asset.get("media_type") == "video":
+        video_data = {
+            "video_id": asset.get("meta_video_id"),
+            "message": primary_text,
+            "title": headline,
+            "call_to_action": cta,
+        }
+        if description:
+            video_data["link_description"] = description
+        return {"object_story_spec": {"page_id": page_id, "video_data": video_data}}
+
+    raise ValueError("Tipo de criativo não suportado pelo wizard.")
+
+
+def build_wizard_structure(context, wizard):
+    draft = dict(wizard.get("draft") or {})
+    assets = list(wizard.get("assets") or [])
+    missing = campaign_wizard_missing(draft, assets)
+    if missing:
+        return None, missing
+
+    campaign_src = dict(draft.get("campaign") or {})
+    campaign = {k: v for k, v in campaign_src.items() if k in WIZARD_CAMPAIGN_ALLOWED_FIELDS and v is not None}
+    campaign.setdefault("buying_type", "AUCTION")
+    campaign.setdefault("is_adset_budget_sharing_enabled", False)
+
+    adset_src = dict(draft.get("adset") or {})
+    adset = {k: v for k, v in adset_src.items() if k in WIZARD_ADSET_ALLOWED_FIELDS and v is not None}
+    if adset_src.get("daily_budget_major") is not None:
+        adset["daily_budget"] = currency_to_minor(context, adset_src["daily_budget_major"])
+    if adset_src.get("lifetime_budget_major") is not None:
+        adset["lifetime_budget"] = currency_to_minor(context, adset_src["lifetime_budget_major"])
+
+    creative = dict(draft.get("creative") or {})
+    ads = []
+    existing_creatives = list(draft.get("existing_creative_ids") or [])
+    for index, creative_id in enumerate(existing_creatives, start=1):
+        ads.append({
+            "name": f"{campaign['name']} - Anúncio {index}",
+            "creative_id": str(creative_id),
+        })
+
+    for index, asset in enumerate(assets, start=len(ads) + 1):
+        asset = dict(asset)
+        ad_name = asset.get("caption") or f"{campaign['name']} - Criativo {index}"
+        ads.append({
+            "name": str(ad_name)[:120],
+            "creative": build_wizard_creative_payload(asset, creative),
+        })
+
+    return {"campaign": campaign, "adset": adset, "ads": ads}, []
+
+
+def campaign_wizard_summary(context, wizard):
+    draft = dict(wizard.get("draft") or {})
+    campaign = dict(draft.get("campaign") or {})
+    adset = dict(draft.get("adset") or {})
+    creative = dict(draft.get("creative") or {})
+    assets = list(wizard.get("assets") or [])
+
+    budget = "não definido"
+    if adset.get("daily_budget_major") is not None:
+        budget = f"{format_brl(adset['daily_budget_major'])}/dia"
+    elif adset.get("lifetime_budget_major") is not None:
+        budget = f"{format_brl(adset['lifetime_budget_major'])} total"
+
+    return {
+        "wizard_id": wizard["id"],
+        "campaign": {
+            "name": campaign.get("name"),
+            "objective": campaign.get("objective"),
+            "business_goal": campaign.get("business_goal"),
+            "special_ad_categories": campaign.get("special_ad_categories"),
+        },
+        "adset": {
+            "name": adset.get("name"),
+            "budget": budget,
+            "targeting": adset.get("targeting"),
+            "optimization_goal": adset.get("optimization_goal"),
+            "billing_event": adset.get("billing_event"),
+            "destination_type": adset.get("destination_type"),
+            "start_time": adset.get("start_time"),
+            "end_time": adset.get("end_time"),
+            "promoted_object": adset.get("promoted_object"),
+        },
+        "creative": {
+            "page_id": creative.get("page_id"),
+            "destination_url": creative.get("destination_url"),
+            "primary_text": creative.get("primary_text"),
+            "headline": creative.get("headline"),
+            "description": creative.get("description"),
+            "call_to_action_type": creative.get("call_to_action_type") or "LEARN_MORE",
+            "assets": len(assets),
+            "existing_creatives": len(draft.get("existing_creative_ids") or []),
+        },
+        "missing": campaign_wizard_missing(draft, assets),
+    }
+
+
+def prepare_campaign_wizard_confirmation(context):
+    wizard = get_active_campaign_wizard(context)
+    if not wizard:
+        return {"ready": False, "reason": "Nenhuma campanha em montagem."}
+    if wizard["status"] == "WAITING_CREATION_CONFIRMATION":
+        return {"ready": True, "summary": campaign_wizard_summary(context, wizard), "confirmation": "Pode criar"}
+    summary = campaign_wizard_summary(context, wizard)
+    if summary["missing"]:
+        return {
+            "ready": False,
+            "missing": summary["missing"],
+            "instruction": "Pergunte apenas o próximo bloco lógico de informações faltantes, em linguagem simples.",
+        }
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "UPDATE campaign_wizards SET status='WAITING_CREATION_CONFIRMATION', updated_at=NOW() WHERE id=%s;",
+                (wizard["id"],),
+            )
+    wizard = get_active_campaign_wizard(context)
+    return {
+        "ready": True,
+        "summary": campaign_wizard_summary(context, wizard),
+        "mandatory_message": (
+            "📋 RESUMO DA CAMPANHA\n\n"
+            "Revise campanha, conjunto e anúncios antes da criação.\n\n"
+            "A estrutura será criada PAUSADA e não haverá gasto neste momento.\n\n"
+            "Se estiver tudo certo, responda: Pode criar."
+        ),
+    }
+
+
+def is_explicit_wizard_create_confirmation(text):
+    n = normalize_text(text or "")
+    negatives = ["nao", "não", "cancela", "cancelar", "nao crie", "não crie"]
+    if any(x in n for x in negatives):
+        return False
+    phrases = ["pode criar", "crie agora", "pode montar", "confirma criacao", "confirmo a criacao", "criar agora"]
+    return any(x in n for x in phrases)
+
+
+def create_campaign_from_wizard(context):
+    wizard = get_active_campaign_wizard(context)
+    if not wizard:
+        return {"created": False, "reason": "Nenhuma campanha em montagem."}
+    if wizard["status"] != "WAITING_CREATION_CONFIRMATION":
+        return {"created": False, "reason": "Primeiro preciso apresentar o resumo e pedir a confirmação de criação."}
+    if not is_explicit_wizard_create_confirmation(context.get("_current_user_text")):
+        return {"created": False, "reason": "A mensagem atual não confirmou explicitamente a criação. Peça: Pode criar."}
+
+    structure, missing = build_wizard_structure(context, wizard)
+    if missing:
+        reopen_campaign_wizard(context)
+        return {"created": False, "missing": missing}
+
+    # create_paused_structure mantém o contrato de segurança: tudo nasce PAUSED.
+    result = create_paused_structure(
+        context,
+        campaign=structure["campaign"],
+        adset=structure["adset"],
+        ads=structure["ads"],
+    )
+    if result.get("created"):
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE campaign_wizards
+                    SET status='CREATED', created_ids=%s::jsonb, completed_at=NOW(), updated_at=NOW()
+                    WHERE id=%s;
+                    """,
+                    (json.dumps(result.get("created_ids") or {}, ensure_ascii=False), wizard["id"]),
+                )
+    return result
+
+
 ACTION_AI_TOOLS = [
     {
         "type": "function",
@@ -5447,8 +6252,8 @@ ACTION_AI_TOOLS = [
         "type": "function",
         "name": "criar_estrutura_pausada",
         "description": (
-            "Quando o cliente pedir explicitamente uma nova campanha, cria campaign, adset e anúncios na Meta sempre PAUSED. "
-            "Depois cria automaticamente uma ação pendente separada para ativação. Nunca use em uma mera recomendação."
+            "Fluxo legado de criação pausada. Na conversa normal com cliente, prefira SEMPRE o Campaign Wizard V10.2. "
+            "Use este caminho somente para compatibilidade técnica/controlada. Nunca use em mera recomendação."
         ),
         "parameters": {
             "type": "object",
@@ -5479,6 +6284,89 @@ ACTION_AI_TOOLS = [
             "properties": {"search": {"type": ["string", "null"]}},
             "additionalProperties": False,
         },
+    },
+    {
+        "type": "function",
+        "name": "iniciar_wizard_campanha",
+        "description": "Inicia ou retorna o Campaign Creation Wizard persistente. Use quando o cliente disser que quer criar/montar uma campanha.",
+        "parameters": {
+            "type": "object",
+            "properties": {"initial": {"type": ["object", "null"], "additionalProperties": True}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "atualizar_wizard_campanha",
+        "description": "Salva no rascunho do wizard informações que o cliente já forneceu em linguagem natural ou áudio.",
+        "parameters": {
+            "type": "object",
+            "properties": {"updates": {"type": "object", "additionalProperties": True}},
+            "required": ["updates"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "consultar_wizard_campanha",
+        "description": "Retorna o estado atual, ativos recebidos e campos faltantes do wizard.",
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "type": "function",
+        "name": "editar_wizard_campanha",
+        "description": "Reabre para edição um wizard que já estava aguardando confirmação de criação.",
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "type": "function",
+        "name": "cancelar_wizard_campanha",
+        "description": "Cancela a campanha em montagem sem criar nada na Meta.",
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "type": "function",
+        "name": "listar_paginas_meta",
+        "description": "Lista Páginas disponíveis para usar como identidade do anúncio. Mostre nomes ao cliente, não IDs técnicos quando possível.",
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "type": "function",
+        "name": "buscar_localizacoes_meta",
+        "description": "Pesquisa localizações válidas da Meta para transformar cidades/regiões ditas pelo cliente em targeting real.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "location_types": {"type": ["array", "null"], "items": {"type": "string"}},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50}
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "buscar_interesses_meta",
+        "description": "Pesquisa interesses válidos da Meta quando a estratégia realmente exigir segmentação por interesses.",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 50}},
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "preparar_confirmacao_wizard",
+        "description": "Valida o rascunho e, quando completo, gera o resumo final antes de criar qualquer objeto na Meta.",
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "type": "function",
+        "name": "criar_campanha_do_wizard",
+        "description": "Cria campanha/conjunto/anúncios SOMENTE após o resumo e a confirmação explícita 'Pode criar'. Tudo nasce PAUSED.",
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
     },
 ]
 
@@ -5597,6 +6485,7 @@ Você conversa com pessoas leigas. Elas não devem precisar abrir o Gerenciador 
 Empresa: {context.get('company_name')}.
 Conta Meta: {context.get('ad_account_id') or 'nenhuma'}.
 Data atual na timezone da conta: {today.isoformat()}.
+Estado do Campaign Wizard: {json.dumps(context.get("_campaign_wizard"), ensure_ascii=False, default=str) if context.get("_campaign_wizard") else "nenhum wizard ativo"}.
 
 MISSÃO
 1. Entender o que o cliente quer, seja texto ou uma transcrição de áudio.
@@ -5632,11 +6521,21 @@ V10 ACTION AI — PRINCÍPIO DE SEGURANÇA
 - Se houver mais de uma ação pendente e a referência estiver ambígua, liste as ações e pergunte qual delas.
 - Nunca trate um "sim" fora de contexto como autorização para gasto ou alteração.
 
-CRIAÇÃO DE CAMPANHA
-- Se o cliente pedir explicitamente para CRIAR/MONTAR uma campanha, obtenha apenas o que for necessário e use criar_estrutura_pausada.
-- Toda campaign, adset e ad criados pela ferramenta devem nascer PAUSED.
-- Não force valores críticos que o cliente não informou e que não podem ser inferidos com segurança. Pergunte em linguagem simples.
-- Se houver uma campanha existente claramente indicada como referência, você pode ler seu setup e propor reutilização/duplicação; não copie silenciosamente algo que o cliente não autorizou.
+CRIAÇÃO DE CAMPANHA — WIZARD HÍBRIDO V10.2
+- Quando o cliente disser que quer criar/montar uma campanha, use iniciar_wizard_campanha.
+- O cliente fala de forma leiga; você traduz para configuração técnica, mas nunca inventa informação crítica.
+- Salve cada informação recebida com atualizar_wizard_campanha. O wizard persiste entre mensagens e áudios.
+- Pergunte apenas UM BLOCO LÓGICO por vez. Ordem preferida: objetivo/nome -> categoria especial -> orçamento/período -> público -> destino/Pixel/evento -> Página -> criativos/copy -> revisão.
+- Para localização/interesses, use buscar_localizacoes_meta/buscar_interesses_meta em vez de inventar IDs.
+- Para Pixel e Página, use listar_pixels/listar_paginas_meta e apresente nomes simples.
+- O cliente pode enviar IMAGEM ou VÍDEO pelo WhatsApp durante o wizard; o backend fará upload controlado para a Meta e anexará o ativo ao rascunho.
+- Você pode escrever/sugerir copy, headline e CTA, mas o cliente deve conseguir revisar antes da criação.
+- Antes de criar qualquer objeto, use preparar_confirmacao_wizard e mostre o resumo.
+- Só use criar_campanha_do_wizard quando a mensagem atual confirmar explicitamente: "Pode criar" ou equivalente inequívoco.
+- Toda campaign, adset e ad criados pelo wizard nascem PAUSED.
+- Depois da criação, a ATIVAÇÃO permanece uma segunda ação pendente e exige nova confirmação.
+- Se o cliente quiser mudar algo depois do resumo, use editar_wizard_campanha, ajuste e gere novo resumo.
+- Não use criar_estrutura_pausada diretamente quando houver wizard ativo; prefira o fluxo determinístico do wizard.
 - Depois de criar a estrutura pausada, mostre uma confirmação curta com três blocos:
 
 🎯 CAMPANHA
@@ -5694,25 +6593,34 @@ PERÍODOS
 - Follow-up: preserve período e entidade da conversa quando fizer sentido.
 
 FORMATO DE RESPOSTA ANALÍTICA
+- Comece com a resposta principal em 1 ou 2 frases.
+- Use no máximo 3 a 5 blocos visuais.
+- Cada bloco deve ter um título curto com UM emoji e MAIÚSCULAS.
+- Prefira bullets quando houver 2+ itens.
+- Nunca faça um parágrafo longo com vários números.
+
 🧠 DIAGNÓSTICO
-Conclusão direta.
+Conclusão direta em até 3 linhas.
 
 📌 EVIDÊNCIAS
-2 a 4 dados relevantes.
+2 a 4 dados realmente necessários.
 
-🔎 LEITURA
-O que isso significa.
+🔎 O QUE ISSO SIGNIFICA
+Traduza os dados para uma decisão de negócio, sem jargão desnecessário.
 
-🎯 PRÓXIMA AÇÃO
-Uma ação concreta. Se ela puder ser executada pelo sistema, diga isso e deixe a ação pendente quando apropriado.
+🎯 O QUE EU FARIA AGORA
+Uma ação concreta, priorizada e explicada em linguagem simples. Se puder ser executada, proponha a ação e peça confirmação.
 
 FORMATAÇÃO WHATSAPP
-- Resposta limpa e curta.
+- O cliente é leigo e lê no celular. Facilite o escaneamento.
 - Sem #, ##, **, _, crases ou tabelas Markdown.
-- Use emojis com parcimônia.
-- Títulos em MAIÚSCULAS.
-- Parágrafos curtos.
-- O backend fará sanitização final das respostas geradas por IA.
+- Não escreva parede de texto.
+- Títulos curtos em MAIÚSCULAS com um emoji.
+- Parágrafos de no máximo 2 a 3 frases.
+- Use uma linha em branco entre blocos.
+- Use • para listas.
+- Não repita a mesma conclusão com palavras diferentes.
+- O backend fará sanitização e quebra final de parágrafos.
 """
 
 
@@ -5803,6 +6711,38 @@ def execute_dynamic_tool(context, tool_name, arguments):
     if tool_name == "consultar_revisao_anuncios":
         return consult_review_status(context, arguments.get("search"))
 
+    if tool_name == "iniciar_wizard_campanha":
+        return start_campaign_wizard(context, arguments.get("initial") or {})
+
+    if tool_name == "atualizar_wizard_campanha":
+        return update_campaign_wizard(context, arguments.get("updates") or {})
+
+    if tool_name == "consultar_wizard_campanha":
+        return get_active_campaign_wizard(context) or {"active": False}
+
+    if tool_name == "editar_wizard_campanha":
+        return reopen_campaign_wizard(context)
+
+    if tool_name == "cancelar_wizard_campanha":
+        return cancel_campaign_wizard(context)
+
+    if tool_name == "listar_paginas_meta":
+        return list_pages_for_wizard(context)
+
+    if tool_name == "buscar_localizacoes_meta":
+        return search_meta_locations(
+            context, arguments.get("query"), arguments.get("location_types"), arguments.get("limit", 20)
+        )
+
+    if tool_name == "buscar_interesses_meta":
+        return search_meta_interests(context, arguments.get("query"), arguments.get("limit", 20))
+
+    if tool_name == "preparar_confirmacao_wizard":
+        return prepare_campaign_wizard_confirmation(context)
+
+    if tool_name == "criar_campanha_do_wizard":
+        return create_campaign_from_wizard(context)
+
     raise ValueError(f"Tool desconhecida: {tool_name}")
 
 
@@ -5833,12 +6773,16 @@ def v91_capabilities():
     }, 200
 
 @app.route("/v10-capabilities", methods=["GET"])
+@app.route("/v102-capabilities", methods=["GET"])
 def v10_capabilities():
     return {
         "build_id": BUILD_ID,
         "engine": ANALYSIS_ENGINE,
         "action_ai_enabled": ACTION_AI_ENABLED,
         "audio_input": True,
+        "image_video_input": True,
+        "campaign_wizard_enabled": CAMPAIGN_WIZARD_ENABLED,
+        "progress_update_seconds": PROGRESS_UPDATE_SECONDS,
         "transcribe_model": OPENAI_TRANSCRIBE_MODEL,
         "review_watcher_enabled": REVIEW_WATCH_ENABLED,
         "writes_require_confirmation": True,
@@ -5853,6 +6797,10 @@ def v10_capabilities():
             "create_pixel_with_confirmation",
             "review_status_notifications",
             "whatsapp_audio_transcription",
+            "campaign_creation_wizard_persistent",
+            "whatsapp_image_video_to_meta_assets",
+            "meta_pages_location_interest_lookup",
+            "progress_heartbeat_every_50s_default",
         ],
     }, 200
 
