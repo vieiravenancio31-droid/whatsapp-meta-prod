@@ -31,7 +31,7 @@ from psycopg.rows import dict_row
 
 app = Flask(__name__)
 
-BUILD_ID = "v11.1-context-aware-operational-followup-2026-09-05"
+BUILD_ID = "v11.2-operational-capability-routing-2026-09-05"
 ANALYSIS_ENGINE = "meta_driven_v11_1_context_routed"
 OBJECTIVE_MAPPING_HARDCODED = False
 print("BOOT BUILD_ID:", BUILD_ID)
@@ -1554,6 +1554,102 @@ def looks_like_operational_followup(text, context=None):
     return False
 
 
+def looks_like_operational_capability_question(text, context=None):
+    """
+    Detecta perguntas sobre capacidade de executar/gerenciar sem tratá-las como autorização.
+
+    Exemplos:
+    - "Agora você já consegue executar a tarefa?"
+    - "Você consegue fazer isso agora?"
+    - "Já pode executar aquela alteração?"
+    - "A ferramenta de gerenciamento já está disponível?"
+
+    Esta função serve somente para escolher a rota operational. Ela NUNCA confirma nem
+    executa uma ação; a confirmação continua passando por is_explicit_confirmation_text().
+    """
+    n = re.sub(r"[.!?]+$", "", normalize_text(text or "").strip())
+    if not n:
+        return False
+
+    # Perguntas explicitamente analíticas continuam nas rotas de análise.
+    if any(term in n for term in (
+        "analise", "diagnost", "por que", "porque", "estrateg", "compare", "comparar",
+        "performance", "desempenho", "gargalo", "o que voce faria",
+    )):
+        return False
+
+    exact = {
+        "agora voce ja consegue executar a tarefa",
+        "agora voce consegue executar a tarefa",
+        "voce ja consegue executar a tarefa",
+        "voce consegue executar a tarefa",
+        "ja consegue executar a tarefa",
+        "consegue executar a tarefa",
+        "agora voce ja consegue fazer a tarefa",
+        "agora voce consegue fazer a tarefa",
+        "voce ja consegue fazer a tarefa",
+        "voce consegue fazer a tarefa",
+        "agora voce consegue fazer isso",
+        "voce consegue fazer isso agora",
+        "voce consegue executar isso agora",
+        "ja pode executar a tarefa",
+        "agora pode executar a tarefa",
+        "tem como executar a tarefa",
+        "da para executar a tarefa",
+        "da pra executar a tarefa",
+        "a ferramenta de gerenciamento ja esta disponivel",
+        "a ferramenta de gerenciamento esta disponivel",
+        "o gerenciamento ja esta disponivel",
+        "o gerenciamento esta disponivel",
+    }
+    if n in exact:
+        return True
+
+    capability_markers = (
+        "consegue", "conseguiria", "ja consegue", "agora consegue", "agora voce consegue",
+        "agora voce ja consegue", "ja pode", "agora pode", "tem como", "da para", "da pra",
+        "esta disponivel", "esta funcionando", "esta habilitado", "esta habilitada",
+    )
+    execution_markers = (
+        "executar", "executa", "fazer", "realizar", "aplicar", "alterar", "gerenciar",
+        "colocar em pratica", "rodar a tarefa",
+    )
+    reference_markers = (
+        "tarefa", "isso", "aquilo", "alteracao", "acao", "recomendacao", "campanha",
+        "orcamento", "meta", "gerenciamento", "ferramenta",
+    )
+
+    has_capability = any(marker in n for marker in capability_markers)
+    has_execution = any(marker in n for marker in execution_markers)
+    has_reference = any(marker in n for marker in reference_markers)
+
+    if "ferramenta de gerenciamento" in n and has_capability:
+        return True
+
+    return has_capability and has_execution and has_reference
+
+
+def routing_reason(text, context=None):
+    """Motivo curto para observabilidade; não usa IA nem altera o roteamento."""
+    if (context or {}).get("_campaign_wizard"):
+        return "wizard_active"
+    if looks_like_operational_followup(text, context):
+        return "operational_followup"
+    if looks_like_operational_capability_question(text, context):
+        return "operational_capability_question"
+    normalized = normalize_text(text or "")
+    if any(term in normalized for term in [
+        "analise", "diagnost", "gargalo", "estrateg", "por que", "compare", "performance", "desempenho"
+    ]):
+        return "analytical_language"
+    if any(term in normalized for term in [
+        "paus", "reativ", "ativar", "reduz", "diminu", "aument", "alterar", "mudar", "ajust",
+        "orcamento", "verba", "duplic", "pixel"
+    ]):
+        return "operational_language"
+    return "default_simple"
+
+
 def classify_ai_route(text, context=None):
     """Roteador determinístico: não gasta tokens para escolher o modelo."""
     normalized = normalize_text(text or "")
@@ -1564,9 +1660,12 @@ def classify_ai_route(text, context=None):
     ]):
         return "wizard"
 
-    # V11.1: continuação curta de uma recomendação/ação anterior deve receber
-    # ferramentas operacionais, mesmo sem repetir "orçamento", "pausar" etc.
+    # V11.2: continuações operacionais e perguntas sobre capacidade de execução
+    # recebem ferramentas de gerenciamento. Perguntar "você consegue executar?" NÃO
+    # é confirmação; apenas escolhe a rota correta.
     if looks_like_operational_followup(text, context):
+        return "operational"
+    if looks_like_operational_capability_question(text, context):
         return "operational"
 
     deep_terms = [
@@ -5159,9 +5258,15 @@ def receive_webhook():
             send_whatsapp_message(sender, native_confirmation.get("message") or "✅ Solicitação processada.")
             return "EVENT_RECEIVED", 200
 
+        pre_route = classify_ai_route(original_text, dict(context))
         print(
             "[V11] ROUTING_TO_AI",
-            {"build_id": BUILD_ID, "sender": sender, "route": classify_ai_route(original_text, dict(context))},
+            {
+                "build_id": BUILD_ID,
+                "sender": sender,
+                "route": pre_route,
+                "reason": routing_reason(original_text, dict(context)),
+            },
         )
 
         if not acquire_analysis_lock(context["user_id"]):
@@ -8743,7 +8848,8 @@ ROTA: OPERAÇÃO
 Priorize ferramentas de orçamento/ação. Para alterar orçamento use propor_alteracao_orcamento. Para pausa/reativação use propor_acao_meta.
 A proposta não executa nada: explique antes/depois e peça confirmação. Não distribua redução entre vários conjuntos sem autorização clara.
 Se a mensagem atual for uma continuação curta como "faz isso", "então faça", "aplica isso" ou "execute a recomendação", use MEMÓRIA RESUMIDA e TURNOS RECENTES para recuperar a recomendação imediatamente anterior.
-Se já existir uma ação pendente inequívoca, o backend normalmente trata a confirmação antes desta rota. Se ainda não existir, transforme a recomendação anterior em uma proposta usando as ferramentas disponíveis.
+Se o cliente perguntar se AGORA você consegue executar uma tarefa/alteração anterior, trate isso como pergunta de capacidade e continuidade. Use o contexto recente e as ferramentas operacionais para responder, mas NÃO execute apenas porque ele perguntou se consegue.
+Se já existir uma ação pendente inequívoca, o backend normalmente trata a confirmação antes desta rota. Se ainda não existir e houver uma recomendação anterior suficientemente específica, transforme-a em uma proposta usando as ferramentas disponíveis e peça confirmação.
 Se a referência anterior não for suficiente para identificar com segurança alvo/valor/ação, faça UMA pergunta objetiva de esclarecimento. Nunca diga que a ferramenta de gerenciamento está indisponível apenas porque a mensagem atual não repetiu os detalhes da recomendação anterior.
 """.strip(),
     "analysis": """
@@ -9053,12 +9159,16 @@ def v10_capabilities():
 
 @app.route("/v11-capabilities", methods=["GET"])
 @app.route("/v111-capabilities", methods=["GET"])
+@app.route("/v112-capabilities", methods=["GET"])
 def v11_capabilities():
     return {
         "build_id": BUILD_ID,
         "smart_model_routing": SMART_MODEL_ROUTING_ENABLED,
         "context_aware_operational_followup": True,
         "short_followup_routes_to_operational": True,
+        "operational_capability_questions_route_to_operational": True,
+        "capability_question_never_counts_as_confirmation": True,
+        "routing_reason_logging": True,
         "pending_action_native_confirmation": True,
         "fast_model": OPENAI_FAST_MODEL,
         "deep_model": OPENAI_DEEP_MODEL,
